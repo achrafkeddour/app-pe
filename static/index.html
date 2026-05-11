@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Platform 5G — PFE 2026</title>
+<link rel="stylesheet" href="design.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+<!-- ═══ SIDEBAR ══════════════════════════════════════════════════════════ -->
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-logo">5G</div>
+    <div class="brand-text">
+      <div class="brand-title">AI Platform 5G</div>
+      <div class="brand-sub">Open5GS + UERANSIM</div>
+    </div>
+  </div>
+
+  <nav class="nav">
+    <button class="nav-item active" data-tab="dashboard">
+      <span class="nav-icon">📊</span>
+      <span>Dashboard</span>
+      <span id="tab-badge-dash" class="nav-badge" style="display:none">0</span>
+    </button>
+    <button class="nav-item" data-tab="alarms">
+      <span class="nav-icon">🚨</span>
+      <span>Alarmes</span>
+      <span id="tab-badge-alarms" class="nav-badge">0</span>
+    </button>
+    <button class="nav-item" data-tab="reco">
+      <span class="nav-icon">💡</span>
+      <span>Recommandations</span>
+      <span id="tab-badge-reco" class="nav-badge">0</span>
+    </button>
+    <button class="nav-item" data-tab="predict">
+      <span class="nav-icon">🔮</span>
+      <span>Prédiction IA</span>
+      <span id="tab-badge-pred" class="nav-badge" style="display:none">0</span>
+    </button>
+    <button class="nav-item" data-tab="pred-reco">
+      <span class="nav-icon">🧬</span>
+      <span>Recos Prédictives</span>
+      <span id="tab-badge-predreco" class="nav-badge" style="display:none">0</span>
+    </button>
+    <button class="nav-item" data-tab="about">
+      <span class="nav-icon">🎓</span>
+      <span>Valeur Ajoutée</span>
+    </button>
+  </nav>
+
+  <div class="sidebar-footer">
+    <div id="health-globe" class="health-globe">
+      <div class="hg-ring"></div>
+      <div class="hg-val" id="hg-val">—</div>
+    </div>
+    <div class="hg-label">GLOBAL HEALTH</div>
+    <div class="status-meta">
+      <span id="meta-ues">—</span> UEs &nbsp;·&nbsp;
+      <span id="meta-gnbs">3</span> gNBs
+    </div>
+    <button class="btn-refresh" id="btn-refresh" onclick="refreshData()">↺ Refresh</button>
+  </div>
+</aside>
+
+<!-- ═══ MAIN ══════════════════════════════════════════════════════════════ -->
+<main class="main">
+
+<!-- ── TOP BAR ──────────────────────────────────────────────────────── -->
+<div class="topbar">
+  <div class="topbar-title" id="tab-title">📊 Dashboard — Vue Globale</div>
+  <div class="topbar-right">
+    <span class="topbar-badge" id="topbar-date">—</span>
+    <span class="topbar-badge" id="topbar-log">—</span>
+    <span class="topbar-badge topbar-live">● LIVE</span>
+  </div>
+</div>
+
+<!-- ══════════════════ TAB: DASHBOARD ═══════════════════════════════════ -->
+<div id="tab-dashboard" class="tab-content active">
+
+  <!-- KPI CARDS ROW 1 -->
+  <div class="kpi-row" id="kpi-row-main"></div>
+
+  <!-- KPI CARDS ROW 2 (extended) -->
+  <div class="section-header">
+    <span class="section-title">📡 Qualité Radio & Signal</span>
+  </div>
+  <div class="kpi-row" id="kpi-row-radio"></div>
+
+  <!-- CHARTS ROW 1 -->
+  <div class="section-header">
+    <span class="section-title">📈 Évolution temporelle</span>
+    <span class="section-sub">Fenêtres 5 min — extraites du log</span>
+  </div>
+  <div class="charts-row">
+    <div class="chart-card" style="flex:2">
+      <div class="chart-title">Erreurs & Warnings / fenêtre 5 min</div>
+      <canvas id="chart-timeline" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Événements réseau / fenêtre</div>
+      <canvas id="chart-events" height="90"></canvas>
+    </div>
+  </div>
+
+  <!-- CHARTS ROW 2 -->
+  <div class="charts-row">
+    <div class="chart-card">
+      <div class="chart-title">Latence UE (ms)</div>
+      <canvas id="chart-latency" height="100"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">DL Throughput UE (Mbps)</div>
+      <canvas id="chart-throughput" height="100"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">UL Throughput UE (Mbps)</div>
+      <canvas id="chart-ul" height="100"></canvas>
+    </div>
+  </div>
+
+  <!-- CHARTS ROW 3 -->
+  <div class="charts-row">
+    <div class="chart-card">
+      <div class="chart-title">PRB Utilisation par Slice (%)</div>
+      <canvas id="chart-prb" height="100"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">RSRP par UE (dBm)</div>
+      <canvas id="chart-rsrp" height="100"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">SINR par UE (dB)</div>
+      <canvas id="chart-sinr" height="100"></canvas>
+    </div>
+  </div>
+
+  <!-- gNB CARDS -->
+  <div class="section-header">
+    <span class="section-title">🗼 gNodeBs</span>
+  </div>
+  <div class="gnb-grid" id="gnb-cards"></div>
+
+  <!-- SLICE SLA TABLE -->
+  <div class="section-header">
+    <span class="section-title">🔷 Network Slices — SLA</span>
+  </div>
+  <div id="slice-sla-container"></div>
+
+  <!-- UPF + SECURITY ROW -->
+  <div class="charts-row">
+    <div class="chart-card">
+      <div class="chart-title">UPF Throughput (Mbps)</div>
+      <canvas id="chart-upf" height="100"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Incidents de Sécurité</div>
+      <canvas id="chart-security" height="100"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Durée des Handovers (ms)</div>
+      <canvas id="chart-ho" height="100"></canvas>
+    </div>
+  </div>
+
+  <!-- UE TABLE -->
+  <div class="section-header">
+    <span class="section-title">📱 UEs — Détail</span>
+    <div class="section-filters">
+      <button class="filter-btn active" data-filter="all">Tous</button>
+      <button class="filter-btn" data-filter="eMBB">eMBB</button>
+      <button class="filter-btn" data-filter="URLLC">URLLC</button>
+      <button class="filter-btn" data-filter="mMTC">mMTC</button>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead><tr>
+        <th>UE ID</th><th>Slice</th><th>gNB</th><th>IP</th>
+        <th>Reg</th><th>PDU</th><th>HO</th>
+        <th>Latence</th><th>DL Mbps</th><th>UL Mbps</th>
+        <th>RSRP</th><th>SINR</th><th>CQI</th><th>Pkt Loss</th>
+      </tr></thead>
+      <tbody id="ue-tbody"></tbody>
+    </table>
+  </div>
+
+  <!-- KPI DETAIL -->
+  <div class="section-header">
+    <span class="section-title">📋 KPIs Détail</span>
+  </div>
+  <div class="kpi-detail-grid" id="kpi-detail"></div>
+
+  <!-- EVENT LOG -->
+  <div class="section-header">
+    <span class="section-title">📋 Log des Événements Critiques</span>
+  </div>
+  <div class="event-log" id="event-log"></div>
+
+  <!-- HANDOVER LIST -->
+  <div class="section-header">
+    <span class="section-title">🔀 Handovers Enregistrés</span>
+  </div>
+  <div class="ho-list" id="ho-list"></div>
+
+  <!-- SECURITY PANEL -->
+  <div class="section-header">
+    <span class="section-title">🛡️ Sécurité</span>
+  </div>
+  <div class="sec-panel">
+    <div class="sec-metrics" id="sec-metrics"></div>
+    <div class="chart-card" style="flex:1">
+      <div class="chart-title">Incidents Sécurité</div>
+      <canvas id="chart-security2" height="100"></canvas>
+    </div>
+  </div>
+
+</div><!-- /tab-dashboard -->
+
+<!-- ══════════════════ TAB: ALARMES ═════════════════════════════════════ -->
+<div id="tab-alarms" class="tab-content">
+  <div class="alarm-stats-row" id="alarm-stats-row"></div>
+  <div class="section-header">
+    <span class="section-title">🚨 Alarmes Actives</span>
+    <button class="btn-sm" onclick="dismissAll()">Tout ignorer</button>
+  </div>
+  <div id="alarm-list"></div>
+
+  <div class="section-header" style="margin-top:32px">
+    <span class="section-title">📱 Statut UEs</span>
+  </div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead><tr>
+        <th>UE ID</th><th>Slice</th><th>gNB</th>
+        <th>Reg</th><th>PDU</th><th>HO</th>
+        <th>Latence</th><th>DL Mbps</th><th>RSRP</th><th>Statut</th>
+      </tr></thead>
+      <tbody id="ue-tbody-alarms"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ══════════════════ TAB: RECOMMANDATIONS ════════════════════════════ -->
+<div id="tab-reco" class="tab-content">
+  <div class="reco-intro">
+    <div class="reco-intro-icon">💡</div>
+    <div>
+      <div class="reco-intro-title">Recommandations d'Optimisation</div>
+      <div class="reco-intro-sub">Basées sur les alarmes actives détectées dans le log Open5GS</div>
+    </div>
+  </div>
+  <div class="reco-grid" id="reco-grid"></div>
+
+  <div class="section-header" style="margin-top:32px">
+    <span class="section-title">📋 Plan d'Action Priorisé</span>
+  </div>
+  <div class="action-plan" id="action-plan"></div>
+</div>
+
+<!-- ══════════════════ TAB: PRÉDICTION IA ═══════════════════════════════ -->
+<div id="tab-predict" class="tab-content">
+  <div class="ai-banner">
+    <div class="ai-banner-icon">🔮</div>
+    <div>
+      <div class="ai-banner-title">Moteur de Prédiction IA</div>
+      <div class="ai-banner-sub">Régression linéaire · EWMA · Analyse multi-KPI — sur données log réelles Open5GS</div>
+    </div>
+    <div class="ai-models">
+      <span class="model-badge">Linear Trend</span>
+      <span class="model-badge">EWMA α=0.3</span>
+      <span class="model-badge">Multi-KPI Fusion</span>
+    </div>
+  </div>
+
+  <div class="predict-grid" id="predict-grid"></div>
+
+  <div class="section-header" style="margin-top:24px">
+    <span class="section-title">📈 Courbes Prédictives</span>
+    <span class="section-sub">Horizon 60 min</span>
+  </div>
+  <div class="charts-row">
+    <div class="chart-card" style="flex:2">
+      <div class="chart-title">Health Score — Actuel vs Prédiction</div>
+      <canvas id="chart-pred-health" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Latence — Prédiction multi-horizon</div>
+      <canvas id="chart-pred-lat" height="90"></canvas>
+    </div>
+  </div>
+  <div class="charts-row">
+    <div class="chart-card">
+      <div class="chart-title">PRB — Évolution prédite (%)</div>
+      <canvas id="chart-pred-prb" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Auth SR — Tendance prédite</div>
+      <canvas id="chart-pred-auth" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">EWMA Signal Quality</div>
+      <canvas id="chart-pred-sqi" height="90"></canvas>
+    </div>
+  </div>
+
+  <div class="section-header" style="margin-top:24px">
+    <span class="section-title">⚠️ Évaluation des Risques</span>
+    <span class="section-sub">Probabilités calculées sur les tendances détectées</span>
+  </div>
+  <div id="risk-grid"></div>
+</div>
+
+<!-- ══════════════════ TAB: RECOMMANDATIONS PRÉDICTIVES ═════════════════ -->
+<div id="tab-pred-reco" class="tab-content">
+  <div class="reco-intro" style="background:linear-gradient(135deg,#1a1040,#0d1f3c)">
+    <div class="reco-intro-icon">🧬</div>
+    <div>
+      <div class="reco-intro-title">Recommandations Prédictives</div>
+      <div class="reco-intro-sub">Optimisations proactives basées sur les prédictions IA — avant que les problèmes surviennent</div>
+    </div>
+  </div>
+  <div class="reco-grid" id="pred-reco-grid"></div>
+
+  <div class="section-header" style="margin-top:28px">
+    <span class="section-title">🎯 Plan d'Action Préventif</span>
+    <span class="section-sub">Ordonné par probabilité de risque</span>
+  </div>
+  <div id="pred-action-plan"></div>
+</div>
+
+<!-- ══════════════════ TAB: VALEUR AJOUTÉE ══════════════════════════════ -->
+<div id="tab-about" class="tab-content">
+  <div class="about-hero">
+    <div class="about-hero-tag">PFE 2026 · Master Télécommunications</div>
+    <h1 class="about-hero-title">Optimization of 5G Networks using AI</h1>
+    <p class="about-hero-sub">Open5GS v2.7.7 + UERANSIM v3.2.6 — Ubuntu 22.04</p>
+  </div>
+
+  <div class="about-section">
+    <h2>📚 État de l'Art — Travaux Existants</h2>
+    <p>Le domaine de l'optimisation des réseaux 5G par l'IA est en pleine expansion. Voici un panorama des approches existantes :</p>
+    <div class="sota-grid" id="sota-grid"></div>
+  </div>
+
+  <div class="about-section">
+    <h2>📊 Tableau Comparatif</h2>
+    <div class="table-wrap">
+      <table class="data-table comparison-table" id="compare-table"></table>
+    </div>
+  </div>
+
+  <div class="about-section">
+    <h2>⚠️ Limites des Approches Existantes</h2>
+    <div class="limits-grid" id="limits-grid"></div>
+  </div>
+
+  <div class="about-section contribution-section">
+    <h2>✨ Contribution de ce Projet</h2>
+    <p class="contrib-intro">Notre plateforme répond directement aux limites identifiées, en proposant une solution <strong>intégrée, temps-réel et open-source</strong> sur un déploiement SA 5G réel.</p>
+    <div class="contrib-grid" id="contrib-grid"></div>
+  </div>
+
+  <div class="about-section">
+    <h2>🏗️ Architecture de la Plateforme</h2>
+    <div class="arch-diagram" id="arch-diagram"></div>
+  </div>
+</div>
+
+</main>
+</div><!-- /app -->
+<script src="script.js"></script>
+</body>
+</html>
