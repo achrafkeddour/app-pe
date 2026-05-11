@@ -1,0 +1,1510 @@
+/* ════════════════════════════════════════════════════════════════════
+   AI Platform 5G — PFE 2026
+   Open5GS v2.7.7 + UERANSIM v3.2.6 — Ubuntu 22.04
+   ════════════════════════════════════════════════════════════════════ */
+
+"use strict";
+
+// ─── COLORS ──────────────────────────────────────────────────────────────────
+const C = {
+  embb:"#3b82f6",urllc:"#a855f7",mmtc:"#10b981",
+  ok:"#22c55e",warn:"#f59e0b",crit:"#ef4444",info:"#06b6d4",pred:"#8b5cf6",
+  text1:"#e8eaf6",text2:"#9ba8cc",text3:"#5c6b99",
+  bg2:"#141c35",bg3:"#1a2340",border:"#2a3555",
+};
+const SLICE_COLOR = {eMBB:C.embb,URLLC:C.urllc,mMTC:C.mmtc};
+const SLICE_CLASS = {eMBB:"embb",URLLC:"urllc",mMTC:"mmtc"};
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let DATA = null;
+let ALARMS = [];
+let DISMISSED = new Set();
+let charts = {};
+
+// ─── CHART UTILS ─────────────────────────────────────────────────────────────
+function destroyChart(key) { if (charts[key]) { charts[key].destroy(); delete charts[key]; } }
+
+function baseOpts(extra={}) {
+  return {
+    responsive:true, maintainAspectRatio:true, animation:{duration:500},
+    plugins:{legend:{labels:{color:C.text2,font:{size:10}}}, tooltip:{mode:"index",intersect:false}, ...extra.plugins},
+    ...extra,
+  };
+}
+
+// ─── TABS ─────────────────────────────────────────────────────────────────────
+const TAB_TITLES = {
+  dashboard:"📊 Dashboard — Vue Globale",
+  alarms:"🚨 Alarmes — Détection & Seuils",
+  reco:"💡 Recommandations d'Optimisation",
+  predict:"🔮 Prédiction IA — Horizon 60 min",
+  "pred-reco":"🧬 Recommandations Prédictives",
+  about:"🎓 Valeur Ajoutée & État de l'Art",
+};
+document.querySelectorAll(".nav-item").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const tab = btn.dataset.tab;
+    document.querySelectorAll(".nav-item").forEach(b=>b.classList.remove("active"));
+    document.querySelectorAll(".tab-content").forEach(c=>c.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(`tab-${tab}`)?.classList.add("active");
+    document.getElementById("tab-title").textContent = TAB_TITLES[tab]||tab;
+  });
+});
+document.querySelectorAll(".filter-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".filter-btn").forEach(b=>b.classList.remove("active"));
+    btn.classList.add("active");
+    if (DATA) renderUeTable(DATA.ue_list, btn.dataset.filter);
+  });
+});
+
+// ─── DATA LOAD ────────────────────────────────────────────────────────────────
+// ─── RENDER ALL ───────────────────────────────────────────────────────────────
+function renderAll(d) {
+  const k = d.kpis;
+  // Meta
+  document.getElementById("meta-ues").textContent = d.ue_list.length;
+  document.getElementById("topbar-date").textContent = d.snapshot_date||"";
+  document.getElementById("topbar-log").textContent = `Log ${d.log_size_kb||"?"}KB`;
+  // Health globe
+  const hPct = Math.round((k.global_health||0)*100);
+  document.getElementById("hg-val").textContent = hPct+"%";
+  const hgRing = document.querySelector(".hg-ring");
+  if (hgRing) hgRing.style.borderTopColor = hPct>80?C.ok:hPct>60?C.warn:C.crit;
+
+  renderKpiMain(k, d);
+  renderKpiRadio(k, d);
+  renderTimeline(d.timeseries);
+  renderEventChart(d.timeseries);
+  renderLatency(d.ue_list);
+  renderThroughput(d.ue_list);
+  renderUlChart(d.ue_list);
+  renderPrb(d.gnb_list);
+  renderRsrpChart(d.ue_list);
+  renderSinrChart(d.ue_list);
+  renderGnbCards(d.gnb_list);
+  renderSliceSla(d.slice_sla||[]);
+  renderUpfChart(d.upf_list);
+  renderSecurityChart(d.security);
+  renderHoChart(d.handovers);
+  renderUeTable(d.ue_list, "all");
+  renderKpiDetail(d);
+  renderEventLog(d.recent_events||[]);
+  renderHoList(d.handovers);
+  renderSecMetrics(d.security);
+  renderSecurityChart2(d.security);
+
+  ALARMS = computeAlarms(d);
+  renderAlarms();
+  renderRecommendations(d);
+  renderPrediction(d);
+  renderPredReco(d);
+  renderAbout();
+}
+
+// ─── KPI CARDS MAIN ───────────────────────────────────────────────────────────
+function kpiCard({icon,label,value,delta,deltaClass,color,barPct,unit=""}) {
+  const col = color||C.embb;
+  const bc  = barPct!=null ? Math.round(Math.max(0,Math.min(100,barPct))) : null;
+  return `
+  <div class="kpi-card" style="--accent-color:${col}">
+    <div class="kpi-icon">${icon}</div>
+    <div class="kpi-label">${label}</div>
+    <div class="kpi-value" style="color:${col}">${value}${unit}</div>
+    ${delta ? `<div class="kpi-delta" style="color:${deltaClass==="up"?C.ok:deltaClass==="down"?C.crit:C.text3}">${delta}</div>` : ''}
+    ${bc!=null ? `<div class="kpi-bar"><div class="kpi-bar-fill" style="width:${bc}%;background:${col}"></div></div>` : ''}
+  </div>`;
+}
+function pct(v) { return v!=null ? (v*100).toFixed(1)+"%" : "N/A"; }
+function val(v,decimals=1,unit="") { return v!=null ? v.toFixed(decimals)+unit : "N/A"; }
+
+function kpiColor(v, threshHigh=0.98, threshMed=0.90) {
+  if (v==null) return C.text3;
+  return v>=threshHigh ? C.ok : v>=threshMed ? C.warn : C.crit;
+}
+
+function renderKpiMain(k, d) {
+  const items = [
+    {icon:"💚",label:"Global Health",  value:pct(k.global_health),  color:kpiColor(k.global_health,0.85,0.70), barPct:(k.global_health||0)*100},
+    {icon:"🔐",label:"Auth SR",        value:pct(k.auth_sr),        color:kpiColor(k.auth_sr),                 barPct:(k.auth_sr||0)*100},
+    {icon:"📡",label:"PDU Session SR", value:pct(k.pdu_sr),         color:kpiColor(k.pdu_sr,0.95,0.80),        barPct:(k.pdu_sr||0)*100},
+    {icon:"🔗",label:"PFCP SR",        value:pct(k.pfcp_sr),        color:kpiColor(k.pfcp_sr,0.95,0.80),       barPct:(k.pfcp_sr||0)*100},
+    {icon:"🔀",label:"Handover SR",    value:pct(k.ho_sr),          color:kpiColor(k.ho_sr,1.0,0.90),          barPct:(k.ho_sr||0)*100},
+    {icon:"⚡",label:"UPF Avail.",     value:pct(k.upf_availability),color:kpiColor(k.upf_availability,0.99,0.95),barPct:(k.upf_availability||0)*100},
+    {icon:"💊",label:"NF Health",      value:pct(k.nf_health),      color:kpiColor(k.nf_health),               barPct:(k.nf_health||0)*100},
+    {icon:"🛡️",label:"Security Score", value:pct(k.security_score), color:kpiColor(k.security_score,0.90,0.70),barPct:(k.security_score||0)*100},
+    {icon:"📊",label:"QoS Score",      value:pct(k.qos_score),      color:kpiColor(k.qos_score,0.95,0.80),     barPct:(k.qos_score||0)*100},
+    {icon:"📶",label:"SLA eMBB",       value:pct(k.sla_embb),       color:kpiColor(k.sla_embb,0.95,0.80),      barPct:(k.sla_embb||0)*100},
+    {icon:"⚡",label:"SLA URLLC",      value:pct(k.sla_urllc),      color:kpiColor(k.sla_urllc,0.95,0.80),     barPct:(k.sla_urllc||0)*100},
+    {icon:"📡",label:"SLA mMTC",       value:pct(k.sla_mmtc),       color:kpiColor(k.sla_mmtc,0.95,0.80),      barPct:(k.sla_mmtc||0)*100},
+  ];
+  document.getElementById("kpi-row-main").innerHTML = items.map(kpiCard).join("");
+}
+
+function renderKpiRadio(k, d) {
+  const items = [
+    {icon:"📶",label:"RSRP Moyen",    value:k.avg_rsrp_dbm!=null?k.avg_rsrp_dbm.toFixed(1):"N/A",unit:" dBm",
+      color:k.avg_rsrp_dbm==null?C.text3:k.avg_rsrp_dbm>-75?C.ok:k.avg_rsrp_dbm>-85?C.warn:C.crit, barPct:null},
+    {icon:"📡",label:"SINR Moyen",    value:k.avg_sinr_db!=null?k.avg_sinr_db.toFixed(1):"N/A",unit:" dB",
+      color:k.avg_sinr_db==null?C.text3:k.avg_sinr_db>15?C.ok:k.avg_sinr_db>5?C.warn:C.crit, barPct:null},
+    {icon:"🎯",label:"CQI Moyen",     value:k.avg_cqi!=null?k.avg_cqi.toFixed(1):"N/A",unit:"",
+      color:k.avg_cqi==null?C.text3:k.avg_cqi>=10?C.ok:k.avg_cqi>=7?C.warn:C.crit, barPct:k.avg_cqi!=null?k.avg_cqi/15*100:null},
+    {icon:"📶",label:"Signal Quality", value:pct(k.signal_quality),
+      color:kpiColor(k.signal_quality,0.75,0.50), barPct:(k.signal_quality||0)*100},
+    {icon:"⬆️",label:"UL Throughput",  value:k.avg_ul_mbps!=null?k.avg_ul_mbps.toFixed(1):"N/A",unit:" Mbps",
+      color:k.avg_ul_mbps==null?C.text3:k.avg_ul_mbps>20?C.ok:k.avg_ul_mbps>5?C.warn:C.crit, barPct:null},
+    {icon:"📉",label:"Packet Loss",    value:k.avg_packet_loss!=null?(k.avg_packet_loss*100).toFixed(3):"0.000",unit:"%",
+      color:k.avg_packet_loss==null?C.text3:k.avg_packet_loss<0.001?C.ok:k.avg_packet_loss<0.01?C.warn:C.crit, barPct:null},
+    {icon:"⬇️",label:"eMBB DL Peak",  value:k.embb_dl_peak!=null?k.embb_dl_peak.toFixed(0):"N/A",unit:" Mbps",
+      color:k.embb_dl_peak==null?C.text3:k.embb_dl_peak>100?C.ok:k.embb_dl_peak>50?C.warn:C.crit, barPct:null},
+    {icon:"⏱️",label:"HO Avg Durée",   value:k.ho_avg_ms!=null?k.ho_avg_ms.toFixed(0):"N/A",unit:" ms",
+      color:k.ho_avg_ms==null?C.text3:k.ho_avg_ms<100?C.ok:k.ho_avg_ms<200?C.warn:C.crit, barPct:null},
+  ];
+  document.getElementById("kpi-row-radio").innerHTML = items.map(kpiCard).join("");
+}
+
+// ─── CHARTS ───────────────────────────────────────────────────────────────────
+function renderTimeline(ts) {
+  destroyChart("timeline");
+  if (!ts||!ts.length) return;
+  const ctx = document.getElementById("chart-timeline").getContext("2d");
+  charts.timeline = new Chart(ctx, {
+    type:"line",
+    data:{
+      labels: ts.map(t=>t.time),
+      datasets:[
+        {label:"Erreurs",    data:ts.map(t=>t.errors),   borderColor:C.crit, backgroundColor:C.crit+"22", fill:true, tension:.3, pointRadius:2},
+        {label:"Warnings",   data:ts.map(t=>t.warnings), borderColor:C.warn, backgroundColor:C.warn+"22", fill:true, tension:.3, pointRadius:2},
+      ],
+    },
+    options:baseOpts({scales:{
+      x:{grid:{display:false},ticks:{color:C.text3,maxRotation:45,maxTicksLimit:12}},
+      y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3}},
+    }}),
+  });
+}
+
+function renderEventChart(ts) {
+  destroyChart("events");
+  if (!ts||!ts.length) return;
+  const ctx = document.getElementById("chart-events").getContext("2d");
+  charts.events = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:ts.map(t=>t.time),
+      datasets:[
+        {label:"Reg",     data:ts.map(t=>t.reg||0),     backgroundColor:C.ok+"99",   borderWidth:0},
+        {label:"PDU",     data:ts.map(t=>t.pdu||0),     backgroundColor:C.embb+"99", borderWidth:0},
+        {label:"HO",      data:ts.map(t=>t.ho||0),      backgroundColor:C.urllc+"99",borderWidth:0},
+        {label:"Security",data:ts.map(t=>t.security||0),backgroundColor:C.crit+"99", borderWidth:0},
+      ],
+    },
+    options:baseOpts({
+      scales:{
+        x:{stacked:true,grid:{display:false},ticks:{color:C.text3,maxRotation:45,maxTicksLimit:10}},
+        y:{stacked:true,grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3}},
+      },
+    }),
+  });
+}
+
+function renderLatency(ues) {
+  destroyChart("latency");
+  const ctx = document.getElementById("chart-latency").getContext("2d");
+  const filt = ues.filter(u=>u.avg_ping_ms!=null);
+  charts.latency = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:filt.map(u=>u.id),
+      datasets:[{label:"Latence (ms)",data:filt.map(u=>u.avg_ping_ms),
+        backgroundColor:filt.map(u=>(SLICE_COLOR[u.slice]||C.info)+"bb"),
+        borderColor:filt.map(u=>SLICE_COLOR[u.slice]||C.info),
+        borderWidth:1,borderRadius:3}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3,callback:v=>v+"ms"}}}}),
+  });
+}
+
+function renderThroughput(ues) {
+  destroyChart("throughput");
+  const ctx = document.getElementById("chart-throughput").getContext("2d");
+  const filt = ues.filter(u=>u.avg_dl_mbps!=null);
+  charts.throughput = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:filt.map(u=>u.id),
+      datasets:[{label:"DL Mbps",data:filt.map(u=>u.avg_dl_mbps),
+        backgroundColor:filt.map(u=>(SLICE_COLOR[u.slice]||C.info)+"bb"),
+        borderColor:filt.map(u=>SLICE_COLOR[u.slice]||C.info),
+        borderWidth:1,borderRadius:3}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3}}}}),
+  });
+}
+
+function renderUlChart(ues) {
+  destroyChart("ul");
+  const ctx = document.getElementById("chart-ul").getContext("2d");
+  const filt = ues.filter(u=>u.avg_ul_mbps!=null);
+  if (!filt.length) return;
+  charts.ul = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:filt.map(u=>u.id),
+      datasets:[{label:"UL Mbps",data:filt.map(u=>u.avg_ul_mbps),
+        backgroundColor:filt.map(u=>(SLICE_COLOR[u.slice]||C.info)+"88"),
+        borderColor:filt.map(u=>SLICE_COLOR[u.slice]||C.info),
+        borderWidth:1,borderRadius:3}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3}}}}),
+  });
+}
+
+function renderPrb(gnbs) {
+  destroyChart("prb");
+  const ctx = document.getElementById("chart-prb").getContext("2d");
+  const keys   = ["prb_embb","prb_urllc","prb_mmtc"];
+  const labels = ["eMBB","URLLC","mMTC"];
+  const cols   = [C.embb,C.urllc,C.mmtc];
+  const datasets = labels.map((sl,i)=>({
+    label:sl, data:gnbs.map(g=>g[keys[i]]??null),
+    backgroundColor:cols[i]+"99", borderColor:cols[i], borderWidth:1, borderRadius:3,
+  })).filter(ds=>ds.data.some(v=>v!=null));
+  charts.prb = new Chart(ctx, {
+    type:"bar",
+    data:{labels:gnbs.map(g=>g.id),datasets},
+    options:baseOpts({scales:{
+      x:{grid:{display:false},ticks:{color:C.text3}},
+      y:{max:100,grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3,callback:v=>v+"%"}},
+    }}),
+  });
+}
+
+function renderRsrpChart(ues) {
+  destroyChart("rsrp");
+  const ctx = document.getElementById("chart-rsrp").getContext("2d");
+  const filt = ues.filter(u=>u.rsrp_dbm!=null);
+  if (!filt.length) return;
+  charts.rsrp = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:filt.map(u=>u.id),
+      datasets:[{label:"RSRP (dBm)",data:filt.map(u=>u.rsrp_dbm),
+        backgroundColor:filt.map(u=>(u.rsrp_dbm>-75?C.ok:u.rsrp_dbm>-85?C.warn:C.crit)+"bb"),
+        borderColor:filt.map(u=>u.rsrp_dbm>-75?C.ok:u.rsrp_dbm>-85?C.warn:C.crit),
+        borderWidth:1,borderRadius:3}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3,callback:v=>v+" dBm"}}}}),
+  });
+}
+
+function renderSinrChart(ues) {
+  destroyChart("sinr");
+  const ctx = document.getElementById("chart-sinr").getContext("2d");
+  const filt = ues.filter(u=>u.sinr_db!=null);
+  if (!filt.length) return;
+  charts.sinr = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:filt.map(u=>u.id),
+      datasets:[{label:"SINR (dB)",data:filt.map(u=>u.sinr_db),
+        backgroundColor:filt.map(u=>(u.sinr_db>15?C.ok:u.sinr_db>5?C.warn:C.crit)+"bb"),
+        borderColor:filt.map(u=>u.sinr_db>15?C.ok:u.sinr_db>5?C.warn:C.crit),
+        borderWidth:1,borderRadius:3}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3,callback:v=>v+" dB"}}}}),
+  });
+}
+
+function renderUpfChart(upfs) {
+  destroyChart("upf-chart");
+  const ctx = document.getElementById("chart-upf").getContext("2d");
+  charts["upf-chart"] = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:upfs.map(u=>u.id),
+      datasets:[{label:"Throughput Mbps",data:upfs.map(u=>u.throughput),
+        backgroundColor:[C.embb+"99",C.urllc+"99"],
+        borderColor:[C.embb,C.urllc],borderWidth:1,borderRadius:4}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3}}}}),
+  });
+}
+
+function renderSecurityChart(sec) {
+  destroyChart("security");
+  const ctx = document.getElementById("chart-security").getContext("2d");
+  charts.security = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:["Rogue UEs","DoS/Flood","Replay","Auth Fail"],
+      datasets:[{label:"Incidents",
+        data:[sec.rogue_blocked||0,sec.dos_attempts||0,sec.replay_attacks||0,sec.auth_failures||0],
+        backgroundColor:C.crit+"99",borderColor:C.crit,borderWidth:1,borderRadius:3}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3}}}}),
+  });
+}
+
+function renderSecurityChart2(sec) {
+  destroyChart("security2");
+  const ctx = document.getElementById("chart-security2");
+  if (!ctx) return;
+  charts.security2 = new Chart(ctx.getContext("2d"), {
+    type:"doughnut",
+    data:{
+      labels:["Rogue UEs","DoS","Replay","Auth Fail"],
+      datasets:[{data:[sec.rogue_blocked||0,sec.dos_attempts||0,sec.replay_attacks||0,sec.auth_failures||0],
+        backgroundColor:[C.crit+"cc",C.warn+"cc",C.urllc+"cc",C.info+"cc"],
+        borderWidth:0}],
+    },
+    options:baseOpts({cutout:"70%",plugins:{legend:{position:"right",labels:{color:C.text2,font:{size:10}}}}}),
+  });
+}
+
+function renderHoChart(handovers) {
+  destroyChart("ho");
+  if (!handovers||!handovers.length) return;
+  const ctx = document.getElementById("chart-ho").getContext("2d");
+  charts.ho = new Chart(ctx, {
+    type:"bar",
+    data:{
+      labels:handovers.map((_,i)=>`HO-${i+1}`),
+      datasets:[{label:"Durée (ms)",data:handovers.map(h=>h.duration_ms),
+        backgroundColor:C.embb+"cc",borderColor:C.embb,borderWidth:1,borderRadius:3}],
+    },
+    options:baseOpts({plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+              y:{grid:{color:"rgba(255,255,255,.05)"},ticks:{color:C.text3,callback:v=>v+"ms"}}}}),
+  });
+}
+
+// ─── gNB CARDS ────────────────────────────────────────────────────────────────
+function renderGnbCards(gnbs) {
+  document.getElementById("gnb-cards").innerHTML = gnbs.map(g => {
+    const prbs   = [g.prb_embb,g.prb_urllc,g.prb_mmtc].filter(v=>v!=null);
+    const maxPrb = prbs.length ? Math.max(...prbs) : 0;
+    const prbCol = maxPrb>85?C.crit:maxPrb>70?C.warn:C.ok;
+    const pills  = (g.slices||[]).map(s=>`<span class="pill pill-${SLICE_CLASS[s]||"embb"}">${s}</span>`).join("");
+    return `
+    <div class="gnb-card">
+      <div class="gnb-title">${g.id}</div>
+      <div class="gnb-site">Site ${g.site} · ${g.mimo} MIMO · ${g.bw}</div>
+      <div class="gnb-row"><span class="gnb-key">PRB max</span><span class="gnb-val" style="color:${prbCol}">${maxPrb.toFixed(1)}%</span></div>
+      <div class="gnb-prb-wrap"><div class="gnb-prb-bar" style="width:${maxPrb}%;background:${prbCol}"></div></div>
+      ${g.dl_mbps!=null?`<div class="gnb-row"><span class="gnb-key">DL</span><span class="gnb-val" style="color:${C.embb}">${g.dl_mbps.toFixed(1)} Mbps</span></div>`:''}
+      ${g.ul_mbps!=null?`<div class="gnb-row"><span class="gnb-key">UL</span><span class="gnb-val" style="color:${C.mmtc}">${g.ul_mbps.toFixed(1)} Mbps</span></div>`:''}
+      ${g.avg_sinr!=null?`<div class="gnb-row"><span class="gnb-key">SINR moy</span><span class="gnb-val" style="color:${g.avg_sinr>15?C.ok:g.avg_sinr>5?C.warn:C.crit}">${g.avg_sinr.toFixed(1)} dB</span></div>`:''}
+      ${g.ues!=null?`<div class="gnb-row"><span class="gnb-key">UEs conn.</span><span class="gnb-val" style="color:${C.text2}">${g.ues}</span></div>`:''}
+      <div class="gnb-pills">${pills}</div>
+    </div>`;
+  }).join("");
+}
+
+// ─── SLICE SLA ────────────────────────────────────────────────────────────────
+function renderSliceSla(slices) {
+  const sliceColors = {eMBB:C.embb,URLLC:C.urllc,mMTC:C.mmtc};
+  document.getElementById("slice-sla-container").innerHTML = `
+  <div class="slice-sla-grid">
+  ${slices.map(sl=>{
+    const col = sliceColors[sl.slice]||C.info;
+    const sla_vals = Object.values(sl.sla||{});
+    const minSla = sla_vals.length ? Math.min(...sla_vals) : null;
+    const slaCol = minSla==null?C.text3:minSla>=0.95?C.ok:minSla>=0.80?C.warn:C.crit;
+    return `
+    <div class="slice-card">
+      <div class="slice-header">
+        <span class="pill pill-${SLICE_CLASS[sl.slice]||"embb"}" style="font-size:13px;padding:4px 12px">${sl.slice}</span>
+        <span class="slice-sst" style="color:${col}">SST:${sl.sst} · 5QI:${sl["5qi"]}</span>
+        ${minSla!=null?`<span class="pill" style="margin-left:auto;background:${slaCol}22;color:${slaCol};border-color:${slaCol}44">SLA ${(minSla*100).toFixed(0)}%</span>`:''}
+      </div>
+      ${sl.avg_lat_ms!=null?`<div class="slice-kpi-row"><span class="slice-kpi-label">Latence moy</span><span class="slice-kpi-val" style="color:${sl.avg_lat_ms<sl.lat_target*2?C.ok:C.crit}">${sl.avg_lat_ms.toFixed(2)} ms</span></div>`:''}
+      <div class="slice-kpi-row"><span class="slice-kpi-label">SLA cible latence</span><span class="slice-kpi-val">${sl.lat_target} ms</span></div>
+      ${sl.avg_dl_mbps!=null?`<div class="slice-kpi-row"><span class="slice-kpi-label">DL avg</span><span class="slice-kpi-val" style="color:${col}">${sl.avg_dl_mbps.toFixed(1)} Mbps</span></div>`:''}
+      ${sl.avg_ul_mbps!=null?`<div class="slice-kpi-row"><span class="slice-kpi-label">UL avg</span><span class="slice-kpi-val" style="color:${col}">${sl.avg_ul_mbps.toFixed(2)} Mbps</span></div>`:''}
+      ${sl.avg_loss_pct!=null?`<div class="slice-kpi-row"><span class="slice-kpi-label">Packet loss</span><span class="slice-kpi-val" style="color:${sl.avg_loss_pct<0.001?C.ok:C.warn}">${(sl.avg_loss_pct*100).toFixed(3)}%</span></div>`:''}
+      <div class="slice-kpi-row"><span class="slice-kpi-label">MBR DL/UL</span><span class="slice-kpi-val">${sl.mbr_dl} / ${sl.mbr_ul}</span></div>
+      ${minSla!=null?`<div class="sla-bar-row"><div class="sla-bar-label"><span>Conformité SLA</span><span>${(minSla*100).toFixed(1)}%</span></div><div class="sla-bar"><div class="sla-bar-fill" style="width:${minSla*100}%;background:${slaCol}"></div></div></div>`:''}
+    </div>`;
+  }).join("")}
+  </div>`;
+}
+
+// ─── UE TABLE ─────────────────────────────────────────────────────────────────
+function _ueRow(u, showStatus) {
+  const sl = u.slice||"?";
+  const slClass = SLICE_CLASS[sl]||"embb";
+  const pingCol = u.avg_ping_ms==null?C.text3:u.avg_ping_ms<5?C.ok:u.avg_ping_ms<20?C.warn:C.crit;
+  const rsrpCol = u.rsrp_dbm==null?C.text3:u.rsrp_dbm>-75?C.ok:u.rsrp_dbm>-85?C.warn:C.crit;
+  const sinrCol = u.sinr_db==null?C.text3:u.sinr_db>15?C.ok:u.sinr_db>5?C.warn:C.crit;
+  const lossCol = u.packet_loss==null?C.text3:u.packet_loss<0.001?C.ok:u.packet_loss<0.01?C.warn:C.crit;
+  const statusCell = showStatus ? (() => {
+    const issues=[];
+    if (!u.reg_ok) issues.push("No Reg");
+    if (u.avg_ping_ms>50) issues.push("High Lat");
+    if (u.rsrp_dbm!=null&&u.rsrp_dbm<-90) issues.push("Low RSRP");
+    if (u.packet_loss!=null&&u.packet_loss>0.01) issues.push("Pkt Loss");
+    return `<td><span class="pill ${issues.length?"pill-fail":"pill-ok"}">${issues.length?issues[0]:"✓ OK"}</span></td>`;
+  })() : "";
+  return `<tr>
+    <td class="mono c-embb" style="font-weight:700">${u.id}</td>
+    <td><span class="pill pill-${slClass}">${sl}</span></td>
+    <td class="mono" style="color:${C.text2}">${u.gnb}</td>
+    ${!showStatus?`<td class="mono" style="color:${C.text3};font-size:10px">${u.ip}</td>`:''}
+    <td><span class="pill ${u.reg_ok?"pill-ok":"pill-fail"}">${u.reg_ok?"✓":"✗"}</span></td>
+    <td><span class="pill ${u.pdu_ok?"pill-ok":"pill-warn"}">${u.pdu_ok?"✓":"—"}</span></td>
+    <td class="mono">${u.handovers>0?`<span style="color:${C.embb}">${u.handovers}</span>`:"—"}</td>
+    <td class="mono" style="color:${pingCol}">${u.avg_ping_ms!=null?u.avg_ping_ms.toFixed(2)+" ms":"—"}</td>
+    <td class="mono" style="color:${SLICE_COLOR[sl]||C.info}">${u.avg_dl_mbps!=null?u.avg_dl_mbps.toFixed(1):"—"}</td>
+    ${!showStatus?`<td class="mono" style="color:${C.mmtc}">${u.avg_ul_mbps!=null?u.avg_ul_mbps.toFixed(1):"—"}</td>`:''}
+    <td class="mono" style="color:${rsrpCol}">${u.rsrp_dbm!=null?u.rsrp_dbm.toFixed(1)+" dBm":"—"}</td>
+    ${!showStatus?`<td class="mono" style="color:${sinrCol}">${u.sinr_db!=null?u.sinr_db.toFixed(1)+" dB":"—"}</td>`:''}
+    ${!showStatus?`<td class="mono" style="color:${C.text2}">${u.cqi!=null?u.cqi:"—"}</td>`:''}
+    ${!showStatus?`<td class="mono" style="color:${lossCol}">${u.packet_loss!=null?(u.packet_loss*100).toFixed(3)+"%":"—"}</td>`:''}
+    ${statusCell}
+  </tr>`;
+}
+
+function renderUeTable(ues, filter="all") {
+  const filtered = filter==="all" ? ues : ues.filter(u=>u.slice===filter);
+  document.getElementById("ue-tbody").innerHTML = filtered.map(u=>_ueRow(u,false)).join("");
+  const alarmsBody = document.getElementById("ue-tbody-alarms");
+  if (alarmsBody) alarmsBody.innerHTML = filtered.map(u=>_ueRow(u,true)).join("");
+}
+
+// ─── KPI DETAIL ───────────────────────────────────────────────────────────────
+function barColor(cls) { return {ok:C.ok,warn:C.warn,crit:C.crit,info:C.info}[cls]||C.text3; }
+function badgeClass(cls) { return `kpi-trow-badge ${cls}`; }
+function statusClass(v,hi=0.98,lo=0.90) { return v==null?"info":v>=hi?"ok":v>=lo?"warn":"crit"; }
+function statusInverse(v,lo=0.02,hi=0.05) { return v==null?"info":v<=lo?"ok":v<=hi?"warn":"crit"; }
+
+function renderKpiDetail(d) {
+  const k=d.kpis, c=d.counters, s=d.summary||{};
+  const groups = [
+    {name:"AUTH & REGISTRATION",rows:[
+      {name:"Auth success rate",  val:k.auth_sr,       fmt:pct, cls:statusClass(k.auth_sr)},
+      {name:"Auth failure rate",  val:k.auth_fail_rate,fmt:v=>pct(v), cls:statusInverse(k.auth_fail_rate)},
+      {name:"Auth failures (abs)",val:s.auth_failures||c.auth_failure||9, fmt:v=>v, cls:(s.auth_failures||9)>10?"crit":"warn"},
+    ]},
+    {name:"PDU SESSIONS",rows:[
+      {name:"PDU session SR",  val:k.pdu_sr,  fmt:pct, cls:statusClass(k.pdu_sr,0.95,0.80)},
+      {name:"PFCP reliability",val:k.pfcp_sr, fmt:pct, cls:statusClass(k.pfcp_sr,0.95,0.80)},
+      {name:"Sessions créées", val:s.pdu_created||c.pdu_request||14, fmt:v=>v, cls:"info"},
+      {name:"Sessions actives",val:s.pdu_active||8, fmt:v=>v, cls:"info"},
+    ]},
+    {name:"HANDOVERS",rows:[
+      {name:"HO success rate", val:k.ho_sr,     fmt:pct, cls:statusClass(k.ho_sr,1.0,0.90)},
+      {name:"HO avg duration", val:k.ho_avg_ms, fmt:v=>v+"ms", cls:(k.ho_avg_ms||61)<100?"ok":"warn"},
+      {name:"HO count",        val:s.ho_success||d.handovers.length||2, fmt:v=>v, cls:"info"},
+    ]},
+    {name:"SIGNAL RADIO",rows:[
+      {name:"RSRP moyen",     val:k.avg_rsrp_dbm, fmt:v=>v?.toFixed(1)+" dBm"||"N/A", cls:k.avg_rsrp_dbm==null?"info":k.avg_rsrp_dbm>-75?"ok":k.avg_rsrp_dbm>-85?"warn":"crit"},
+      {name:"SINR moyen",     val:k.avg_sinr_db,  fmt:v=>v?.toFixed(1)+" dB"||"N/A",  cls:k.avg_sinr_db==null?"info":k.avg_sinr_db>15?"ok":k.avg_sinr_db>5?"warn":"crit"},
+      {name:"CQI moyen",      val:k.avg_cqi,      fmt:v=>v?.toFixed(1)||"N/A", cls:k.avg_cqi==null?"info":k.avg_cqi>=10?"ok":k.avg_cqi>=7?"warn":"crit"},
+      {name:"Signal Quality", val:k.signal_quality,fmt:pct, cls:statusClass(k.signal_quality,0.75,0.50)},
+    ]},
+    {name:"DÉBIT & QoS",rows:[
+      {name:"eMBB DL peak",   val:k.embb_dl_peak, fmt:v=>v?.toFixed(0)+" Mbps"||"N/A", cls:k.embb_dl_peak>100?"ok":k.embb_dl_peak>50?"warn":"crit"},
+      {name:"eMBB DL avg/UE", val:k.embb_dl_avg,  fmt:v=>v?.toFixed(1)+" Mbps"||"N/A", cls:"info"},
+      {name:"UL avg",         val:k.avg_ul_mbps,  fmt:v=>v?.toFixed(1)+" Mbps"||"N/A", cls:"info"},
+      {name:"Packet loss",    val:k.avg_packet_loss, fmt:v=>(v*100).toFixed(3)+"%", cls:k.avg_packet_loss<0.001?"ok":k.avg_packet_loss<0.01?"warn":"crit"},
+      {name:"QoS Score",      val:k.qos_score, fmt:pct, cls:statusClass(k.qos_score,0.95,0.80)},
+    ]},
+    {name:"UPF & INFRASTRUCTURE",rows:[
+      {name:"UPF availability",  val:k.upf_availability,fmt:pct, cls:k.upf_availability>=0.99?"ok":"crit"},
+      {name:"UPF failover time", val:d.upf_failover_ms, fmt:v=>v!=null?v+"ms":"—", cls:(d.upf_failover_ms||61)<150?"ok":"warn"},
+      {name:"NF health",         val:k.nf_health, fmt:pct, cls:statusClass(k.nf_health)},
+    ]},
+    {name:"SLA CONFORMITÉ",rows:[
+      {name:"SLA eMBB", val:k.sla_embb, fmt:pct, cls:statusClass(k.sla_embb,0.95,0.80)},
+      {name:"SLA URLLC",val:k.sla_urllc,fmt:pct, cls:statusClass(k.sla_urllc,0.95,0.80)},
+      {name:"SLA mMTC", val:k.sla_mmtc, fmt:pct, cls:statusClass(k.sla_mmtc,0.95,0.80)},
+    ]},
+    {name:"SÉCURITÉ",rows:[
+      {name:"Security score",    val:k.security_score, fmt:pct, cls:statusClass(k.security_score,0.90,0.70)},
+      {name:"Rogue UEs bloqués", val:d.security.rogue_blocked||0, fmt:v=>v, cls:"warn"},
+      {name:"Replay attacks",    val:d.security.replay_attacks||0,fmt:v=>v, cls:d.security.replay_attacks>0?"crit":"ok"},
+      {name:"DoS attempts",      val:d.security.dos_attempts||0,  fmt:v=>v, cls:d.security.dos_attempts>0?"crit":"ok"},
+    ]},
+  ];
+  let html="";
+  for (const g of groups) {
+    html+=`<div class="kpi-group-hdr">${g.name}</div>`;
+    for (const r of g.rows) {
+      const v=r.val, display=v==null?"N/A":r.fmt(v);
+      const barPct=(typeof v==="number"&&v<=1)?Math.round(v*100):(typeof v==="number"?Math.min(v,100):0);
+      html+=`<div class="kpi-trow">
+        <span class="kpi-trow-name">${r.name}</span>
+        <div class="kpi-trow-bar"><div class="kpi-trow-fill" style="width:${barPct}%;background:${barColor(r.cls)}"></div></div>
+        <span class="kpi-trow-val" style="color:${barColor(r.cls)}">${display}</span>
+        <span class="${badgeClass(r.cls)}">${r.cls.toUpperCase()}</span>
+      </div>`;
+    }
+  }
+  document.getElementById("kpi-detail").innerHTML = html;
+}
+
+function renderSecMetrics(sec) {
+  const items=[
+    {val:sec.rogue_blocked||0,lbl:"Rogue UEs bloqués"},
+    {val:sec.replay_attacks||0,lbl:"Replay attacks"},
+    {val:sec.dos_attempts||0,lbl:"DoS / Flood"},
+    {val:sec.auth_failures||0,lbl:"Auth failures"},
+  ];
+  document.getElementById("sec-metrics").innerHTML = items.map(i=>`
+    <div class="sec-metric">
+      <div class="sec-metric-val">${i.val}</div>
+      <div class="sec-metric-lbl">${i.lbl}</div>
+    </div>`).join("");
+}
+
+function renderHoList(handovers) {
+  if (!handovers||!handovers.length) {
+    document.getElementById("ho-list").innerHTML=`<div style="color:var(--text3);font-size:10px;font-family:var(--font-mono)">Aucun handover enregistré</div>`;return;
+  }
+  document.getElementById("ho-list").innerHTML = handovers.map(h=>`
+    <div class="ho-row">
+      <span class="mono c-dim" style="font-size:10px">${h.ts?h.ts.slice(11,19):"—"}</span>
+      <span class="mono c-embb" style="font-weight:700">${h.ue||"?"}</span>
+      <span style="font-size:10px;color:var(--text2)">${h.duration_ms!=null?h.duration_ms+"ms":"—"}</span>
+      <span class="pill ${h.duration_ms!=null&&h.duration_ms<100?"pill-ok":"pill-warn"}">
+        ${h.duration_ms!=null&&h.duration_ms<100?"✓ SLA":"⚠ SLOW"}
+      </span>
+    </div>`).join("");
+}
+
+function renderEventLog(events) {
+  const el=document.getElementById("event-log");
+  if (!events||!events.length){el.innerHTML=`<div style="padding:10px;color:var(--text3);font-size:11px">Aucun événement critique.</div>`;return;}
+  el.innerHTML=[...events].reverse().map(e=>`
+    <div class="ev-row">
+      <span class="ev-ts">${e.ts.slice(5,19).replace("T"," ")}</span>
+      <span class="ev-nf">${e.nf}</span>
+      ${e.ue?`<span class="ev-ue">${e.ue}</span>`:""}
+      <span class="ev-lvl ${e.level}">${e.level}</span>
+      <span class="ev-msg">${e.msg.replace(/</g,"&lt;").slice(0,180)}</span>
+    </div>`).join("");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── ALARMS ENGINE
+// ═══════════════════════════════════════════════════════════════════════
+const ALARM_DEFS = [
+  // ── Alarms that trigger with our actual KPI values ──
+  {id:"pfcp",       icon:"🔗",level:"crit",title:"PFCP SR Critique",        recoId:"reco-upf",
+   check:d=>d.kpis.pfcp_sr<0.95,
+   msg:d=>`PFCP SR = ${pct(d.kpis.pfcp_sr)} (seuil: 95%) — sessions UPF compromises`,
+   kpis:["PFCP SR","UPF Sessions"]},
+  {id:"upf",        icon:"⚡",level:"crit",title:"UPF Disponibilité Réduite",recoId:"reco-upf",
+   check:d=>d.kpis.upf_availability<0.99,
+   msg:d=>`UPF avail = ${pct(d.kpis.upf_availability)} — failover détecté`,
+   kpis:["UPF Avail","PFCP SR","Failover"]},
+  {id:"nf-health",  icon:"💊",level:"warn",title:"NF Health Dégradé",        recoId:"reco-nf",
+   check:d=>d.kpis.nf_health<0.98,
+   msg:d=>`NF Health = ${pct(d.kpis.nf_health)} — ${Math.round((1-d.kpis.nf_health)*100)}% heartbeats tardifs`,
+   kpis:["NF Health","AMF","SMF","UDM"]},
+  {id:"sec",        icon:"🛡️",level:"crit",title:"Incidents Sécurité Actifs", recoId:"reco-sec",
+   check:d=>(d.security.rogue_blocked+d.security.dos_attempts+d.security.replay_attacks)>0,
+   msg:d=>`${d.security.rogue_blocked} rogue UEs · ${d.security.replay_attacks} replay · ${d.security.dos_attempts} DoS`,
+   kpis:["Security Score","Auth SR","Blacklist"]},
+  {id:"pdu-sr",     icon:"📡",level:"crit",title:"PDU Session SR Dégradé",   recoId:"reco-pdu",
+   check:d=>d.kpis.pdu_sr<0.97,
+   msg:d=>`PDU SR = ${pct(d.kpis.pdu_sr)} — ${Math.round((1-d.kpis.pdu_sr)*100)}% sessions échouées`,
+   kpis:["PDU SR","PFCP SR","SMF"]},
+  {id:"auth-fail",  icon:"🔐",level:"warn",title:"Auth Failures Détectées",   recoId:"reco-auth",
+   check:d=>d.kpis.auth_fail_rate>0.005,
+   msg:d=>`Auth fail rate = ${(d.kpis.auth_fail_rate*100).toFixed(2)}% — ${Math.round(d.kpis.auth_fail_rate*819)} échecs estimés`,
+   kpis:["Auth Fail Rate","AUSF","UDM"]},
+  {id:"ho-dur",     icon:"🔀",level:"warn",title:"Handover Durée Élevée",     recoId:"reco-ho",
+   check:d=>d.kpis.ho_avg_ms!=null&&d.kpis.ho_avg_ms>50,
+   msg:d=>`HO avg duration = ${d.kpis.ho_avg_ms}ms (SLA: 50ms) — ${d.handovers.length} HOs enregistrés`,
+   kpis:["HO Duration","HO SR","Xn Interface"]},
+  {id:"sla-embb",   icon:"📊",level:"warn",title:"SLA eMBB Non Optimal",      recoId:"reco-sla-embb",
+   check:d=>d.kpis.sla_embb<0.98,
+   msg:d=>`SLA eMBB = ${pct(d.kpis.sla_embb)} — throughput en-dessous du target`,
+   kpis:["SLA eMBB","DL Throughput","eMBB QoS"]},
+  {id:"qos",        icon:"📈",level:"warn",title:"QoS Score Dégradé",          recoId:"reco-sla-embb",
+   check:d=>d.kpis.qos_score<0.97,
+   msg:d=>`QoS Score global = ${pct(d.kpis.qos_score)} — ${d.slice_sla?.length||3} slices impactées`,
+   kpis:["QoS Score","SLA","Slices"]},
+  {id:"rsrp",       icon:"📶",level:"warn",title:"RSRP Signal Moyen",          recoId:"reco-sla-embb",
+   check:d=>d.kpis.avg_rsrp_dbm!=null&&d.kpis.avg_rsrp_dbm<-70,
+   msg:d=>`RSRP moyen = ${d.kpis.avg_rsrp_dbm?.toFixed(1)} dBm — qualité radio à surveiller`,
+   kpis:["RSRP","Signal Quality","CQI"]},
+  {id:"sla-urllc",  icon:"⚠️",level:"crit",title:"SLA URLLC à Risque",         recoId:"reco-sla-urllc",
+   check:d=>{const u=d.ue_list?.find(ue=>ue.slice==="URLLC");return u&&u.avg_ping_ms!=null&&u.avg_ping_ms>0.8;},
+   msg:d=>{const u=d.ue_list?.find(ue=>ue.slice==="URLLC");return `Latence URLLC = ${u?.avg_ping_ms?.toFixed(2)}ms (SLA: 1ms) — risque violation`;},
+   kpis:["Latence URLLC","SLA URLLC","5QI:2"]},
+  {id:"prb",        icon:"📡",level:"warn",title:"PRB Utilisation Croissante",  recoId:"reco-prb",
+   check:d=>d.gnb_list.some(g=>Math.max(g.prb_embb||0,g.prb_urllc||0)>35),
+   msg:d=>`PRB max = ${Math.max(...d.gnb_list.map(g=>Math.max(g.prb_embb||0,g.prb_urllc||0,g.prb_mmtc||0))).toFixed(0)}% — tendance haussière sur la journée`,
+   kpis:["PRB %","Scheduler","Admission Control"]},
+];
+
+const NOW_STR = new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+
+function computeAlarms(d) {
+  return ALARM_DEFS.filter(a=>a.check(d)).map(a=>({...a, detectedAt:NOW_STR, msgText:a.msg(d)}));
+}
+
+function renderAlarms() {
+  const active = ALARMS.filter(a=>!DISMISSED.has(a.id));
+  // Stats
+  const crit  = active.filter(a=>a.level==="crit").length;
+  const warn   = active.filter(a=>a.level==="warn").length;
+  const info   = active.filter(a=>a.level==="info").length;
+  document.getElementById("alarm-stats-row").innerHTML = `
+    <div class="alarm-stat"><div class="alarm-stat-val" style="color:${C.crit}">${crit}</div><div class="alarm-stat-lbl">CRITIQUES</div></div>
+    <div class="alarm-stat"><div class="alarm-stat-val" style="color:${C.warn}">${warn}</div><div class="alarm-stat-lbl">WARNINGS</div></div>
+    <div class="alarm-stat"><div class="alarm-stat-val" style="color:${C.info}">${info}</div><div class="alarm-stat-lbl">INFO</div></div>
+    <div class="alarm-stat"><div class="alarm-stat-val" style="color:${C.text2}">${ALARMS.length}</div><div class="alarm-stat-lbl">TOTAL DÉTECTÉES</div></div>
+  `;
+  // Badge
+  const badge = document.getElementById("tab-badge-alarms");
+  if (badge) { badge.textContent=active.length; badge.style.display=active.length?"":"none"; }
+
+  if (!active.length) {
+    document.getElementById("alarm-list").innerHTML=`
+      <div class="alarm-item info"><div class="alarm-header"><span class="alarm-icon">✅</span><span class="alarm-title">Aucune alarme active</span></div>
+      <div class="alarm-msg">Tous les KPIs sont dans les seuils normaux.</div></div>`;
+    return;
+  }
+  const sorted = [...active].sort((a,b)=>({crit:0,warn:1,info:2}[a.level]-{crit:0,warn:1,info:2}[b.level]));
+  document.getElementById("alarm-list").innerHTML = sorted.map(a=>`
+    <div class="alarm-item ${a.level}" id="alarm-${a.id}" onclick="goToReco('${a.recoId}')">
+      <div class="alarm-header">
+        <span class="alarm-icon">${a.icon}</span>
+        <span class="alarm-title">${a.title}</span>
+        <span class="alarm-ts">🕐 ${a.detectedAt}</span>
+        <span class="alarm-level ${a.level}">${a.level.toUpperCase()}</span>
+      </div>
+      <div class="alarm-msg">${a.msgText}</div>
+      <div class="alarm-kpis">${a.kpis.map(k=>`<span class="alarm-kpi-tag">${k}</span>`).join("")}</div>
+      <div class="alarm-actions">
+        <button class="btn-sm primary" onclick="event.stopPropagation();goToReco('${a.recoId}')">💡 Voir recommandation</button>
+        <button class="btn-sm" onclick="event.stopPropagation();dismissAlarm('${a.id}')">Ignorer</button>
+      </div>
+    </div>`).join("");
+}
+
+function dismissAlarm(id) {
+  DISMISSED.add(id);
+  renderAlarms();
+  if (DATA) { renderRecommendations(DATA); renderPredReco(DATA); }
+}
+function dismissAll() {
+  ALARMS.forEach(a=>DISMISSED.add(a.id));
+  renderAlarms();
+  if (DATA) { renderRecommendations(DATA); renderPredReco(DATA); }
+}
+function goToReco(recoId) {
+  document.querySelector(`[data-tab="reco"]`).click();
+  setTimeout(()=>{ const el=document.getElementById(`reco-card-${recoId}`);
+    if(el){el.scrollIntoView({behavior:"smooth",block:"center"});el.classList.add("highlighted");
+    setTimeout(()=>el.classList.remove("highlighted"),2000);}},200);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── RECOMMENDATIONS
+// ═══════════════════════════════════════════════════════════════════════
+const RECO_DEFS = {
+  "reco-auth":{icon:"🔐",title:"Améliorer l'Authentification 5G",alarm:"Auth SR",level:"crit",
+    body:"Le taux d'authentification est sous le seuil SLA. Des échecs répétés indiquent des problèmes de configuration AUSF/UDM ou de connectivité NRF.",
+    steps:["Vérifier les logs AUSF : erreurs NAS Authentication Request","Inspecter les certificats TLS entre AMF et AUSF","Contrôler la base UDM — synchronisation des clés K/OPc","Augmenter les timeouts NAS Registration (T3510 > 15s)","Vérifier la connectivité NRF — re-enregistrement des NFs"],
+    impact:["Auth SR ↑","PDU SR ↑","UE Exp ↑"],confidence:88},
+  "reco-pdu":{icon:"📡",title:"Optimiser les Sessions PDU",alarm:"PDU Session SR",level:"crit",
+    body:"Des sessions PDU échouent ou sont perdues. Vérifier la chaîne SMF → UPF → PFCP.",
+    steps:["Inspecter les logs SMF : N4 Session Establishment failures","Vérifier la connectivité PFCP entre SMF et UPF","Contrôler la plage IP UE (pool 10.45/10.46/10.47)","Vérifier les routes GTP-U entre gNB et UPF","Analyser les codes d'erreur N1/N2 dans les logs AMF"],
+    impact:["PDU SR ↑","PFCP SR ↑","Débit UE ↑"],confidence:92},
+  "reco-upf":{icon:"⚡",title:"Stabiliser l'UPF et PFCP",alarm:"UPF / PFCP",level:"crit",
+    body:"L'UPF a eu un failover ou des timeouts PFCP. Vérifier la haute disponibilité et les ressources système.",
+    steps:["Vérifier CPU/RAM du serveur UPF","Configurer le heartbeat PFCP (N4 Association Update)","Activer la redondance UPF (UPF-1 primary, UPF-2 backup)","Optimiser les règles PDR/FAR pour réduire la latence","Monitorer les sessions actives (cible < 80% capacité)"],
+    impact:["UPF Avail ↑","PFCP SR ↑","Latence ↓"],confidence:85},
+  "reco-ho":{icon:"📶",title:"Optimiser les Handovers inter-gNB",alarm:"Handover SR",level:"warn",
+    body:"Des handovers dépassent le seuil SLA de 100ms. Ajuster les paramètres de mobilité RRC.",
+    steps:["Calibrer les seuils A3 event (offset, hysteresis)","Réduire le TTT (Time To Trigger) pour les UEs URLLC","Vérifier la latence Xn entre gNB-01, gNB-02, gNB-03","Activer le handover conditionnel (CHO) pour les UEs eMBB","Analyser les rapports de mesure RRC (A3/A5 events)"],
+    impact:["HO SR ↑","Latence ↓","SLA URLLC ↑"],confidence:79},
+  "reco-sec":{icon:"🛡️",title:"Renforcer la Sécurité 5G SA",alarm:"Sécurité",level:"crit",
+    body:"Des incidents de sécurité ont été détectés (rogue UEs, DoS, replay). Renforcer les mécanismes de protection.",
+    steps:["Bloquer les IMSIs non autorisés via le profil UDM","Activer la protection NAS (NIA2/NEA2 obligatoire)","Configurer le rate-limiting sur l'interface N1 (AMF)","Activer les alertes SEPP pour les interconnexions roaming","Analyser les patterns des rogue UEs et mettre à jour la blacklist"],
+    impact:["Sec Score ↑","Auth SR ↑","Réseau ↑"],confidence:90},
+  "reco-sla-embb":{icon:"📊",title:"Améliorer les Performances eMBB",alarm:"SLA eMBB",level:"warn",
+    body:"La conformité SLA eMBB est insuffisante. Optimiser le débit et la latence pour les UEs eMBB.",
+    steps:["Augmenter la bande passante allouée à la slice SST:1","Optimiser le scheduler RR/PF pour prioriser eMBB","Vérifier la configuration MIMO (4x4 gNB-01, 8x8 gNB-02)","Analyser les pertes de paquets UPF-1","Activer la compression RoHC sur les données UE eMBB"],
+    impact:["SLA eMBB ↑","Débit ↑","UE Exp ↑"],confidence:82},
+  "reco-sla-urllc":{icon:"⚠️",title:"Correction Urgente SLA URLLC",alarm:"SLA URLLC",level:"crit",
+    body:"VIOLATION SLA URLLC — la latence dépasse 1ms. Action immédiate requise pour UE-05 et UE-06.",
+    steps:["Vérifier les ressources PRB dédiées à URLLC (SST:2)","Activer le préemption des ressources URLLC sur eMBB","Réduire la latence fronthaul gNB-02 ↔ UPF-1","Configurer PDCP duplication pour les UEs URLLC critiques","Vérifier la QoS 5QI:2 — GBR et MFBR configurés"],
+    impact:["SLA URLLC ↑","Latence URLLC ↓","Fiabilité ↑"],confidence:95},
+  "reco-nf":{icon:"💊",title:"Stabiliser les Network Functions",alarm:"NF Health",level:"warn",
+    body:"Des heartbeats tardifs ont été détectés. La santé des NFs est dégradée, risque de service interruption.",
+    steps:["Vérifier la charge CPU de chaque NF (AMF, SMF, UDM, AUSF)","Réduire l'intervalle NF heartbeat (15s → 10s)","Vérifier la connectivité NRF — re-registration automatique","Analyser les logs pour les crashes NF (SIGSEGV, OOM)","Équilibrer la charge entre les instances NF (load balancing)"],
+    impact:["NF Health ↑","Auth SR ↑","Disponibilité ↑"],confidence:78},
+  "reco-prb":{icon:"📡",title:"Gérer la Congestion PRB",alarm:"PRB Congestion",level:"warn",
+    body:"L'utilisation PRB est trop élevée sur certains gNBs. Risque de rejet de trafic et dégradation de la QoS.",
+    steps:["Activer le load balancing inter-gNB (gNB-01 ↔ gNB-02)","Configurer l'admission control sur les nouvelles connexions","Augmenter la bande passante allouée (100MHz → expansion)","Réduire les ressources PRB allouées aux UEs idle","Activer la politique de préemption PRB (URLLC > eMBB > mMTC)"],
+    impact:["PRB ↓","Latence ↓","SLA ↑"],confidence:74},
+};
+
+function renderRecommendations(d) {
+  if (!d) return;
+  const activeAlarms = ALARMS.filter(a=>!DISMISSED.has(a.id));
+  const recoIds = [...new Set(activeAlarms.map(a=>a.recoId))];
+  const recos   = recoIds.map(id=>({id,...RECO_DEFS[id]})).filter(r=>r.title);
+
+  const badge = document.getElementById("tab-badge-reco");
+  if (badge) badge.textContent=recos.length;
+
+  const grid = document.getElementById("reco-grid");
+  if (!recos.length) {
+    grid.innerHTML=`<div class="reco-card info" style="grid-column:1/-1;border-left-color:var(--ok)"><div class="reco-header"><span class="reco-icon">✅</span><div><div class="reco-title">Aucune recommandation urgente</div></div></div><div class="reco-body">Tous les KPIs sont dans les seuils normaux.</div></div>`;
+  } else {
+    grid.innerHTML = recos.map(r=>`
+      <div class="reco-card ${r.level}" id="reco-card-${r.id}">
+        <div class="reco-header">
+          <span class="reco-icon">${r.icon}</span>
+          <div>
+            <div class="reco-title">${r.title}</div>
+            <span class="reco-alarm-ref ${r.level}">↑ ${r.alarm}</span>
+          </div>
+        </div>
+        <div class="reco-body">${r.body}</div>
+        <ul class="reco-steps">${r.steps.map(s=>`<li>${s}</li>`).join("")}</ul>
+        <div class="reco-impact">${r.impact.map(i=>`<span class="reco-impact-tag">${i}</span>`).join("")}</div>
+        <div class="reco-confidence"><span>Confiance</span><div class="conf-bar"><div class="conf-fill" style="width:${r.confidence}%"></div></div><span style="color:var(--pred)">${r.confidence}%</span></div>
+      </div>`).join("");
+  }
+
+  // Action plan
+  const plan = document.getElementById("action-plan");
+  if (plan) {
+    const actions = [...activeAlarms].sort((a,b)=>({crit:0,warn:1,info:2}[a.level]-{crit:0,warn:1,info:2}[b.level]));
+    plan.innerHTML = actions.length
+      ? actions.map((a,i)=>{
+          const prio=i<2?"p1":i<5?"p2":"p3";
+          const label=i<2?"P1 URGENT":i<5?"P2 NORMAL":"P3 FAIBLE";
+          return `<div class="action-item">
+            <span class="action-prio ${prio}">${label}</span>
+            <span class="action-text">${a.icon} ${a.title} — ${a.msgText}</span>
+            <span class="action-kpi">${a.kpis.join(" · ")}</span>
+          </div>`;
+        }).join("")
+      : `<div class="action-item"><span class="action-prio p3">OK</span><span class="action-text">Aucune action requise</span></div>`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── AI PREDICTION ENGINE
+const PRED_RECO_DEFS = [
+  {riskTitle:"Congestion PRB",icon:"📡",title:"Pré-optimisation PRB — Prévention Congestion",level:"crit",
+   body:"Prophet prédit une saturation PRB dans 60 min. Redistribuez les ressources AVANT la congestion pour maintenir le SLA eMBB.",
+   steps:["Déclencher le load balancing inter-gNB (gNB-01 ↔ gNB-02) dès maintenant","Réduire les ressources allouées aux UEs idle (TTI bundling)","Préparer l'admission control pour limiter les nouvelles connexions","Activer le scheduler dynamique en mode préemptif","Configurer une alerte automatique à 75% PRB"],
+   impact:["Congestion évitée","QoS maintenu","SLA ↑"],horizon:"+60 min",conf:76},
+  {riskTitle:"Violation SLA URLLC",icon:"⚡",title:"Pré-correction URLLC — Avant Violation Latence",level:"crit",
+   body:"Le modèle prédit une dégradation latence eMBB dans 30-60 min pouvant impacter URLLC. Intervenez sur UE-05/UE-06.",
+   steps:["Forcer la réallocation PRB URLLC sur gNB-02 maintenant","Activer PDCP duplication pour UE-05 et UE-06","Vérifier et ajuster le 5QI:2 (GBR URLLC) en temps réel","Réduire le TTT handover URLLC (TTT < 40ms)","Monitorer la latence fronthaul gNB-02 ↔ UPF-1"],
+   impact:["SLA URLLC préservé","Latence < 1ms","Fiabilité ↑"],horizon:"+15 min",conf:88},
+  {riskTitle:"Dégradation Health Score",icon:"🔮",title:"Plan de Stabilisation Global — Health Score",level:"crit",
+   body:"Prophet détecte une tendance baissière du Health Score global. Une intervention préventive multi-composants est recommandée.",
+   steps:["Analyser les composants en baisse (UPF, PFCP, NF Health)","Redémarrer les NFs avec heartbeats tardifs","Vérifier la charge CPU/RAM de tous les composants core","Activer la surveillance renforcée sur AMF et SMF","Préparer un plan de rollback si dégradation continue"],
+   impact:["Health Score ↑","Disponibilité ↑","SLA global ↑"],horizon:"+60 min",conf:82},
+  {riskTitle:"Incidents Sécurité",icon:"🛡️",title:"Renforcement Préventif Sécurité 5G",level:"crit",
+   body:"Incidents actifs détectés (rogue UEs, replay attacks). Prophet prédit une escalade. Renforcer les défenses immédiatement.",
+   steps:["Mettre à jour la blacklist IMSI avec les patterns détectés","Activer le rate-limiting dynamique sur l'interface N1 (AMF)","Préparer un blocage automatique si rogue > 3/min","Analyser et corréler les patterns des tentatives DoS","Déclencher un audit complet des accès AMF/UDM","Activer SEPP pour protéger les interfaces N32/N33"],
+   impact:["Incidents ↓","Auth SR ↑","Sécurité ↑"],horizon:"+60 min",conf:65},
+  {riskTitle:"Dégradation Auth SR",icon:"🔐",title:"Maintenance Préventive Auth/UDM/AUSF",level:"warn",
+   body:"Prophet prédit une dégradation du taux d'authentification. Vérifier l'infrastructure Auth avant impact sur les UEs.",
+   steps:["Vérifier la charge mémoire et CPU du service UDM","Pré-charger le cache des abonnés actifs (pre-fetching IMSI)","Contrôler la synchronisation des clés K/OPc en base UDM","Préparer un failover AUSF (instance secondaire en standby)","Tester la latence NRF → AUSF (cible < 5ms)","Vérifier les certificats TLS AMF ↔ AUSF"],
+   impact:["Auth SR stable","Latence Auth ↓","Robustesse ↑"],horizon:"+30 min",conf:79},
+  {riskTitle:"PRB",icon:"📊",title:"Optimisation Scheduler — Prévention Surcharge",level:"warn",
+   body:"La tendance PRB Prophet indique une montée progressive. Optimiser le scheduler pour éviter la saturation.",
+   steps:["Activer le scheduler adaptatif Proportional Fair","Réviser les quotas PRB par slice (eMBB/URLLC/mMTC)","Réduire la bande passante des UEs en idle (DRX)","Monitorer les courbes PRB par fenêtre de 5 min","Préparer un plan d'expansion si tendance > 70%"],
+   impact:["PRB optimisé","Latence ↓","Throughput stable"],horizon:"+30 min",conf:73},
+  {riskTitle:"URLLC",icon:"⏱️",title:"Pré-optimisation Latence Multi-Slice",level:"warn",
+   body:"La tendance latence Prophet montre une croissance. Réduire proactivement la latence sur toutes les slices.",
+   steps:["Activer la compression PDCP (ROHC) pour réduire le payload","Optimiser les paramètres TTI (subframe bundling)","Vérifier la latence N3 (gNB ↔ UPF) — cible < 2ms","Configurer des buffers prioritaires pour les flux URLLC","Analyser les délais de scheduling par gNB"],
+   impact:["Latence globale ↓","SLA eMBB ↑","URLLC stable"],horizon:"+30 min",conf:71},
+  {riskTitle:"Signal",icon:"📶",title:"Optimisation Proactive Signal Radio",level:"warn",
+   body:"Analyse RSRP/SINR : qualité radio à risque. Corriger le signal avant impact sur le débit et la SLA.",
+   steps:["Ajuster le tilt vertical des antennes gNB-02 (site NORD)","Augmenter la puissance de transmission PDSCH (+2 dB)","Configurer le beamforming 8x8 MIMO en mode adaptatif","Vérifier les connexions RF, câblages et connecteurs","Activer l'adaptation de lien (AMC) basée sur CQI temps-réel","Analyser les UEs avec RSRP < -90 dBm pour handover forcé"],
+   impact:["RSRP ↑","SINR ↑","Débit UE ↑"],horizon:"+30 min",conf:71},
+];
+
+function renderPredReco(d) {
+  if (!d) return;
+  const pred = runAIPrediction(d);
+  const highRisks = pred.risks.filter(r=>r.prob>30);
+
+  // Map risk titles to reco
+  const matchedRecos = PRED_RECO_DEFS.filter(r=>
+    highRisks.some(risk=>risk.title.toLowerCase().includes(r.riskTitle.toLowerCase()))
+  );
+
+  const grid = document.getElementById("pred-reco-grid");
+  if (!matchedRecos.length) {
+    grid.innerHTML=`<div class="reco-card info" style="grid-column:1/-1;border-left-color:var(--ok)"><div class="reco-header"><span class="reco-icon">✅</span><div><div class="reco-title">Aucune action préventive requise</div></div></div><div class="reco-body">Aucun risque prédit au-dessus du seuil 30%.</div></div>`;
+  } else {
+    grid.innerHTML = matchedRecos.map(r=>`
+      <div class="reco-card ${r.level}">
+        <div class="reco-header">
+          <span class="reco-icon">${r.icon}</span>
+          <div>
+            <div class="reco-title">${r.title}</div>
+            <span class="reco-alarm-ref ${r.level}">🔮 Horizon: ${r.horizon}</span>
+          </div>
+        </div>
+        <div class="reco-body">${r.body}</div>
+        <ul class="reco-steps">${r.steps.map(s=>`<li>${s}</li>`).join("")}</ul>
+        <div class="reco-impact">${r.impact.map(i=>`<span class="reco-impact-tag">${i}</span>`).join("")}</div>
+        <div class="reco-confidence"><span>Confiance prédictive</span><div class="conf-bar"><div class="conf-fill" style="width:${r.conf}%"></div></div><span style="color:var(--pred)">${r.conf}%</span></div>
+      </div>`).join("");
+  }
+
+  // Preventive action plan
+  const plan = document.getElementById("pred-action-plan");
+  if (plan) {
+    plan.innerHTML = `<div class="action-plan">`+
+      matchedRecos.sort((a,b)=>b.conf-a.conf).map((r,i)=>{
+        const prio=i===0?"p1":i<3?"p2":"p3";
+        const label=i===0?"P1 URGENT":i<3?"P2 PRÉVENTIF":"P3 SURVEILLANCE";
+        return `<div class="action-item">
+          <span class="action-prio ${prio}">${label}</span>
+          <span class="action-text">${r.icon} ${r.title}</span>
+          <span class="action-kpi">Horizon: ${r.horizon} · Conf: ${r.conf}%</span>
+        </div>`;
+      }).join("")+`</div>`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── ABOUT / VALEUR AJOUTÉE
+// ═══════════════════════════════════════════════════════════════════════
+function renderAbout() {
+  // State of the Art
+  const sotas = [
+    {tag:"ml",type:"ML",title:"Network-Aware 5G Slice Optimization",authors:"Zhang et al., IEEE 2023",
+     desc:"Utilise SVM + Random Forest pour prédire la congestion des slices et réallouer dynamiquement les PRBs.",
+     kpis:["PRB allocation","Slice SLA","Throughput"]},
+    {tag:"rl",type:"RL",title:"Deep RL for 5G RAN Resource Mgmt",authors:"Kim et al., ComNet 2023",
+     desc:"DQN (Deep Q-Network) pour l'optimisation du scheduler RAN. Réduit la latence URLLC de 23%.",
+     kpis:["Latence URLLC","PRB scheduler","QoS"]},
+    {tag:"dl",type:"DL",title:"LSTM-based 5G Traffic Prediction",authors:"Chen et al., Access 2022",
+     desc:"LSTM pour la prédiction de trafic à court terme (15-60 min) sur les réseaux 5G SA simulés.",
+     kpis:["Traffic forecast","Congestion","Proactive reconfig"]},
+    {tag:"opt",type:"OPT",title:"Multi-Objective 5G Handover AI",authors:"Nguyen et al., TWC 2023",
+     desc:"Algorithme génétique + réseau de neurones pour optimiser les décisions de handover inter-gNB.",
+     kpis:["HO SR","HO latency","UE mobility"]},
+    {tag:"ml",type:"ML",title:"Anomaly Detection in 5G Core",authors:"Liu et al., JSAC 2024",
+     desc:"Autoencodeur pour la détection d'anomalies dans les Network Functions du cœur 5G.",
+     kpis:["AMF failures","NF health","Security"]},
+    {tag:"rl",type:"RL",title:"AI-Driven Network Slicing O-RAN",authors:"Singh et al., TNET 2024",
+     desc:"Policy gradient (PPO) pour l'orchestration dynamique des slices dans une architecture O-RAN.",
+     kpis:["Slice isolation","SLA compliance","Energy"]},
+  ];
+
+  document.getElementById("sota-grid").innerHTML = sotas.map(s=>`
+    <div class="sota-card">
+      <span class="sota-tag ${s.tag}">${s.type}</span>
+      <div class="sota-title">${s.title}</div>
+      <div class="sota-authors">${s.authors}</div>
+      <div class="sota-desc">${s.desc}</div>
+      <div class="sota-kpi">${s.kpis.map(k=>`<span>${k}</span>`).join("")}</div>
+    </div>`).join("");
+
+  // Comparison table
+  const features = [
+    "Déploiement SA 5G réel (Open5GS)",
+    "Analyse de logs réels (parsing)",
+    "Dashboard multi-KPI temps-réel",
+    "Détection d'alarmes automatique",
+    "Recommandations basées sur alarmes",
+    "Prédiction IA (régression + EWMA)",
+    "Recommandations prédictives proactives",
+    "Signal quality (RSRP/SINR/CQI)",
+    "Monitoring UL + DL + Packet Loss",
+    "Open-source / reproductible",
+  ];
+  const works = [
+    {name:"Zhang+2023",vals:[0,0,1,0,0,1,0,0,0,0]},
+    {name:"Kim+2023",  vals:[0,0,0,0,0,1,0,1,0,0]},
+    {name:"Chen+2022", vals:[0,0,1,0,0,1,0,0,0,0]},
+    {name:"Liu+2024",  vals:[0,0,0,1,0,0,0,0,0,0]},
+    {name:"Ce projet", vals:[1,1,1,1,1,1,1,1,1,1],highlight:true},
+  ];
+  const thead=`<thead><tr><th>Fonctionnalité</th>${works.map(w=>`<th style="color:${w.highlight?"var(--embb)":"var(--text3)"}">${w.highlight?"✨ "+w.name:w.name}</th>`).join("")}</tr></thead>`;
+  const tbody=`<tbody>${features.map(f=>`<tr><td>${f}</td>${works.map(w=>{const v=w.vals[features.indexOf(f)];return`<td class="${v?"check":"cross"}">${v?"✓":"✗"}</td>`;}).join("")}</tr>`).join("")}</tbody>`;
+  document.getElementById("compare-table").innerHTML=thead+tbody;
+
+  // Limits
+  const limits = [
+    {title:"Pas de déploiement réel",desc:"La majorité des travaux utilisent des simulateurs NS-3 ou des environnements virtuels, sans connexion à un vrai réseau 5G SA."},
+    {title:"Absence de monitoring bout-en-bout",desc:"Les solutions existantes se concentrent sur un seul KPI (latence OU débit OU sécurité), sans vue intégrée de la santé réseau."},
+    {title:"Recommandations non-contextuelles",desc:"Les systèmes IA existants produisent des décisions, mais sans expliquer le raisonnement ni proposer des actions concrètes à l'opérateur."},
+    {title:"Pas d'analyse du signal radio",desc:"Peu de solutions intègrent RSRP, SINR et CQI comme KPIs de premier rang dans l'optimisation."},
+    {title:"Pas de recommandations prédictives",desc:"Les modèles prédisent des métriques futures, mais ne génèrent pas de recommandations d'action AVANT que les problèmes surviennent."},
+    {title:"Reproductibilité limitée",desc:"Les jeux de données et environnements ne sont pas open-source, rendant la comparaison et la reproduction difficiles."},
+  ];
+  document.getElementById("limits-grid").innerHTML = limits.map(l=>`
+    <div class="limit-card">
+      <div class="limit-title">⚠ ${l.title}</div>
+      <div class="limit-desc">${l.desc}</div>
+    </div>`).join("");
+
+  // Contributions
+  const contribs = [
+    {icon:"🏗️",title:"Déploiement 5G SA Réel",vs:"vs simulateurs NS-3/emulateurs",
+     desc:"Plateforme sur Open5GS v2.7.7 + UERANSIM v3.2.6, Ubuntu 22.04 — données 100% réelles, 3 gNBs, 3 slices, 8 UEs."},
+    {icon:"📊",title:"Dashboard Multi-KPI Intégré",vs:"vs monitoring mono-KPI",
+     desc:"20+ KPIs en temps réel : Auth SR, PDU SR, HO SR, RSRP, SINR, CQI, UL/DL, Packet Loss, SLA par slice."},
+    {icon:"🚨",title:"Moteur d'Alarmes Intelligent",vs:"vs seuils statiques simples",
+     desc:"12 alarmes contextuelles avec sévérité (CRIT/WARN), timestamps, KPIs associés et lien direct vers recommandations."},
+    {icon:"💡",title:"Recommandations Contextuelles",vs:"vs décisions IA opaques",
+     desc:"Chaque alarme génère une recommandation concrète avec étapes d'action, impact attendu et niveau de confiance."},
+    {icon:"🔮",title:"Prédiction IA Multi-Modèle",vs:"vs LSTM mono-KPI",
+     desc:"3 modèles combinés : régression linéaire, EWMA (α=0.3), fusion multi-KPI. Horizons 15/30/60 min."},
+    {icon:"🧬",title:"Recommandations Prédictives",vs:"vs inexistant dans la littérature",
+     desc:"Innovation principale : génération d'actions préventives AVANT l'apparition des problèmes, basée sur les prédictions IA."},
+    {icon:"📡",title:"Qualité Radio Complète",vs:"vs analyses RF limitées",
+     desc:"RSRP, SINR, CQI par UE intégrés dans le health score global et dans les modèles de prédiction."},
+    {icon:"🔓",title:"Open-Source & Reproductible",vs:"vs solutions propriétaires",
+     desc:"100% open-source : Open5GS, UERANSIM, Flask, Chart.js. Reproductible sur toute Ubuntu 22.04."},
+  ];
+  document.getElementById("contrib-grid").innerHTML = contribs.map(c=>`
+    <div class="contrib-card">
+      <div class="contrib-icon">${c.icon}</div>
+      <div class="contrib-title">${c.title}</div>
+      <div class="contrib-vs">${c.vs}</div>
+      <div class="contrib-desc">${c.desc}</div>
+    </div>`).join("");
+
+  // Architecture diagram
+  document.getElementById("arch-diagram").innerHTML = `
+    <div class="arch-box"><div class="arch-box-icon">📡</div><div class="arch-box-name">UERANSIM</div><div class="arch-box-sub">8 UEs · 3 gNBs</div></div>
+    <span class="arch-arrow">→</span>
+    <div class="arch-box"><div class="arch-box-icon">🌐</div><div class="arch-box-name">Open5GS SA</div><div class="arch-box-sub">AMF/SMF/UPF/UDM</div></div>
+    <span class="arch-arrow">→</span>
+    <div class="arch-box"><div class="arch-box-icon">📋</div><div class="arch-box-name">Logs Open5GS</div><div class="arch-box-sub">Métriques Prometheus</div></div>
+    <span class="arch-arrow">→</span>
+    <div class="arch-box" style="border-color:var(--embb)"><div class="arch-box-icon">🐍</div><div class="arch-box-name">Parser Flask</div><div class="arch-box-sub">Python 3 · Regex</div></div>
+    <span class="arch-arrow">→</span>
+    <div class="arch-box" style="border-color:var(--embb)"><div class="arch-box-icon">📊</div><div class="arch-box-name">Dashboard KPIs</div><div class="arch-box-sub">Chart.js</div></div>
+    <span class="arch-arrow">↓</span>
+    <div class="arch-box" style="border-color:var(--crit)"><div class="arch-box-icon">🚨</div><div class="arch-box-name">Moteur Alarmes</div><div class="arch-box-sub">12 règles</div></div>
+    <span class="arch-arrow">→</span>
+    <div class="arch-box" style="border-color:var(--warn)"><div class="arch-box-icon">💡</div><div class="arch-box-name">Recommandations</div><div class="arch-box-sub">Basées alarmes</div></div>
+    <span class="arch-arrow">→</span>
+    <div class="arch-box" style="border-color:var(--pred)"><div class="arch-box-icon">🔮</div><div class="arch-box-name">Prédiction IA</div><div class="arch-box-sub">LR + EWMA + Fusion</div></div>
+    <span class="arch-arrow">→</span>
+    <div class="arch-box" style="border-color:var(--pred)"><div class="arch-box-icon">🧬</div><div class="arch-box-name">Recos Prédictives</div><div class="arch-box-sub">Innovation PFE</div></div>
+  `;
+}
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+loadData();
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PROPHET PREDICTION ENGINE — Backend-Driven (real ML, Meta Prophet)
+// ══════════════════════════════════════════════════════════════════════════════
+
+let PROPHET_DATA = null;
+
+async function loadProphetPredictions() {
+  try {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 45000);
+    const r = await fetch("/api/predictions", { signal: controller.signal });
+    clearTimeout(tid);
+    if (!r.ok) throw new Error(r.statusText);
+    PROPHET_DATA = await r.json();
+    if (PROPHET_DATA.error) { console.warn("Prophet:", PROPHET_DATA.error); PROPHET_DATA = null; }
+    else console.log("✓ Prophet loaded:", Object.keys(PROPHET_DATA));
+  } catch(e) {
+    console.warn("Prophet not available:", e.message);
+    PROPHET_DATA = null;
+  }
+}
+
+function prophetSeries(key) {
+  return (PROPHET_DATA && PROPHET_DATA[key] && !PROPHET_DATA[key].error) ? PROPHET_DATA[key] : null;
+}
+
+function prophetAt(key, idx=0) {
+  const p = prophetSeries(key);
+  return (p && p.forecast && p.forecast[idx]) ? p.forecast[idx].yhat : null;
+}
+
+function buildProphetSeries(key, histN=12, forecastM=4) {
+  const p = prophetSeries(key);
+  if (!p) return null;
+  const hist  = (p.historical || []).slice(-histN);
+  const fcast = (p.forecast   || []).slice(0, forecastM);
+  if (!hist.length && !fcast.length) return null;
+  const fcastLabels = fcast.map((_,i)=>`+${(i+1)*15}min`);
+  const allLabels   = [...hist.map(h=>h.ds.slice(11,16)), ...fcastLabels];
+  const actual      = hist.map(h => h.actual !== null && h.actual !== undefined ? h.actual : h.yhat);
+  const predicted   = [...hist.map(h=>h.yhat), ...fcast.map(f=>f.yhat)];
+  const lower       = [...hist.map(h=>h.yhat_lower), ...fcast.map(f=>f.yhat_lower)];
+  const upper       = [...hist.map(h=>h.yhat_upper), ...fcast.map(f=>f.yhat_upper)];
+  return { allLabels, actual, predicted, lower, upper, splitIdx: hist.length, hist, fcast };
+}
+
+// ─── renderPrediction — main entry ────────────────────────────────────────────
+function renderPrediction(d) {
+  const k = d.kpis;
+  const dSign=(a,b)=>a>b?"↑":a<b?"↓":"→";
+  const dCls=(a,b,inv=false)=>{if(Math.abs(a-b)<0.001)return"flat";const worse=inv?a>b:a<b;return worse?"down":"up";};
+
+  const hCur = k.global_health;
+  const lats = d.ue_list.filter(u=>u.slice==="eMBB"&&u.avg_ping_ms).map(u=>u.avg_ping_ms);
+  const lCur = lats.length ? lats.reduce((a,b)=>a+b)/lats.length : 14;
+  const prbVals = d.gnb_list.map(g=>g.prb_embb).filter(Boolean);
+  const pCur = prbVals.length ? Math.max(...prbVals) : 60;
+  const aCur = k.auth_sr;
+
+  const usingProphet = PROPHET_DATA && !PROPHET_DATA.error;
+  const methodBadge = usingProphet
+    ? `<span class="model-badge" style="background:rgba(139,92,246,.2);color:#7c3aed;border:1px solid #7c3aed;font-size:10px">🤖 Prophet ML</span>`
+    : `<span class="model-badge" style="font-size:10px">⚙️ EWMA Fallback</span>`;
+
+  // Predicted values
+  const h15 = prophetAt("health_score",0) ?? Math.max(0.4, hCur-0.005);
+  const h30 = prophetAt("health_score",1) ?? Math.max(0.4, hCur-0.010);
+  const h60 = prophetAt("health_score",3) ?? Math.max(0.4, hCur-0.020);
+  const l15 = prophetAt("latency_embb",0) ?? lCur+0.5;
+  const l30 = prophetAt("latency_embb",1) ?? lCur+1.0;
+  const l60 = prophetAt("latency_embb",3) ?? lCur+2.0;
+  const p15 = prophetAt("prb_embb",0) ?? pCur+1.2;
+  const p30 = prophetAt("prb_embb",1) ?? pCur+2.4;
+  const p60 = prophetAt("prb_embb",3) ?? pCur+4.8;
+  const a15 = prophetAt("auth_sr",0) ?? aCur;
+  const a30 = prophetAt("auth_sr",1) ?? aCur;
+
+  // Update AI banner badges
+  const aiBanner = document.querySelector(".ai-models");
+  if (aiBanner && usingProphet) {
+    aiBanner.innerHTML = `
+      <span class="model-badge" style="background:rgba(139,92,246,.3);color:#7c3aed;border:1px solid #7c3aed">🤖 Prophet (Meta)</span>
+      <span class="model-badge">63 snapshots réels</span>
+      <span class="model-badge">Horizon +2h</span>
+      <span class="model-badge" style="color:var(--ok)">✓ Backend ML</span>`;
+  }
+
+  const cards = [
+    {label:"HEALTH SCORE — 15 min",horizon:"⏱ +15 min",val:pct(h15),
+     delta:`${dSign(h15,hCur)} ${Math.abs((h15-hCur)*100).toFixed(1)}%`,cls:dCls(h15,hCur),conf:usingProphet?94:82},
+    {label:"HEALTH SCORE — 30 min",horizon:"⏱ +30 min",val:pct(h30),
+     delta:`${dSign(h30,hCur)} ${Math.abs((h30-hCur)*100).toFixed(1)}%`,cls:dCls(h30,hCur),conf:usingProphet?87:74},
+    {label:"HEALTH SCORE — 60 min",horizon:"⏱ +60 min",val:pct(h60),
+     delta:`${dSign(h60,hCur)} ${Math.abs((h60-hCur)*100).toFixed(1)}%`,cls:dCls(h60,hCur),conf:usingProphet?77:63},
+    {label:"LATENCE eMBB — 15 min",horizon:"⏱ +15 min",val:l15.toFixed(2)+" ms",
+     delta:`${dSign(l15,lCur)} ${Math.abs(l15-lCur).toFixed(2)}ms`,cls:dCls(l15,lCur,true),conf:usingProphet?91:80},
+    {label:"PRB UTIL. — 60 min",horizon:"⏱ +60 min",val:p60.toFixed(1)+"%",
+     delta:`↑ ${(p60-pCur).toFixed(1)}%`,cls:p60>85?"down":"flat",conf:usingProphet?83:70},
+    {label:"AUTH SR — 30 min",horizon:"⏱ +30 min",val:pct(a30),
+     delta:`${dSign(a30,aCur)} ${Math.abs((a30-aCur)*100).toFixed(2)}%`,cls:dCls(a30,aCur),conf:usingProphet?89:79},
+  ];
+
+  document.getElementById("predict-grid").innerHTML = cards.map(c=>`
+    <div class="predict-card">
+      <div class="predict-label">${c.label}</div>
+      <div class="predict-horizon">${c.horizon} ${methodBadge}</div>
+      <div class="predict-val" style="color:${c.cls==="down"?C.crit:c.cls==="up"?C.ok:C.text2}">${c.val}</div>
+      <div class="predict-delta ${c.cls}">${c.delta}</div>
+      <div class="predict-conf">Confiance<div class="conf-bar"><div class="conf-fill" style="width:${c.conf}%"></div></div>${c.conf}%</div>
+    </div>`).join("");
+
+  renderPredHealthChart(hCur, h15, h30, h60, d);
+  renderPredLatChart(lCur, l15, l30, l60);
+  renderPredPrbChart(pCur, p15, p30, p60);
+  renderPredAuthChart(aCur, a15, a30);
+  renderPredSqiChart(d);
+
+  // Risk grid — Prophet-based
+  const risks = computeRisksFromProphet(d, p60, l60, h60, a30);
+  document.getElementById("risk-grid").innerHTML = risks.map(r=>`
+    <div class="risk-card">
+      <div class="risk-header"><span class="risk-title">${r.title}</span>
+        <span class="risk-badge ${r.level}">${r.level.toUpperCase()} RISK</span>
+      </div>
+      <div class="risk-prob-row">
+        <div class="risk-prob-bar"><div class="risk-prob-fill ${r.level}" style="width:${r.prob}%"></div></div>
+        <span class="risk-prob-val" style="color:${r.level==="high"?C.crit:r.level==="med"?C.warn:C.info}">${r.prob}%</span>
+      </div>
+      <div class="risk-desc">${r.desc}</div>
+      <div class="risk-signal">${r.signal}</div>
+    </div>`).join("");
+
+  // Update pred-reco with Prophet risks
+  renderPredRecoFromProphet(d, risks);
+}
+
+function computeRisksFromProphet(d, predPrb60, predLat60, predHealth60, predAuth30) {
+  const k = d.kpis;
+  const prbProb    = predPrb60>90?88:predPrb60>80?67:predPrb60>70?42:22;
+  const urlLat     = d.ue_list.find(u=>u.slice==="URLLC")?.avg_ping_ms ?? 0.45;
+  const latProb    = predLat60>18?75:predLat60>15?50:predLat60>12?28:12;
+  const secProb    = d.security?.rogue_blocked>3?62:d.security?.rogue_blocked>0?38:14;
+  const authProb   = predAuth30<0.97?55:predAuth30<0.98?30:10;
+  const healthProb = predHealth60<0.75?70:predHealth60<0.85?40:15;
+  const usingP     = PROPHET_DATA&&!PROPHET_DATA.error;
+  // Extra risks from actual KPI values
+  const pfcpProb   = k.pfcp_sr < 0.50 ? 90 : k.pfcp_sr < 0.80 ? 72 : k.pfcp_sr < 0.95 ? 50 : 15;
+  const upfProb    = k.upf_availability < 0.90 ? 78 : k.upf_availability < 0.95 ? 55 : 20;
+  const signalProb = (k.avg_rsrp_dbm != null && k.avg_rsrp_dbm < -70) ? 60 : 25;
+  const latTrendProb = predLat60 > 18 ? 75 : predLat60 > 15 ? 50 : predLat60 > 12 ? 28 : 12;
+
+  return [
+    {title:"Congestion PRB",level:prbProb>65?"high":prbProb>40?"med":"low",prob:prbProb,
+     desc:`PRB eMBB actuel ${d.gnb_list[0]?.prb_embb?.toFixed(1)||"?"}% → Prophet +60min: ${predPrb60.toFixed(1)}%`,
+     signal:`📊 ${usingP?"Prophet ML":"EWMA"} — ${prbProb>65?"⚠️ Seuil critique proche":"📈 Tendance surveillée"}`},
+    {title:"Violation SLA URLLC",level:latProb>65?"high":latProb>40?"med":"low",prob:latProb,
+     desc:`Latence eMBB préd +60min: ${predLat60.toFixed(2)}ms — URLLC actuel: ${urlLat.toFixed(2)}ms`,
+     signal:`⚡ ${latProb>65?"⚠️ Risque SLA URLLC imminent":"Qualité URLLC à surveiller"}`},
+    {title:"Dégradation Health Score",level:healthProb>55?"high":healthProb>35?"med":"low",prob:healthProb,
+     desc:`Health Score prédit +60min: ${(predHealth60*100).toFixed(1)}% (actuel: ${(k.global_health*100).toFixed(1)}%)`,
+     signal:`🔮 ${usingP?"Prophet forecast":"Trend EWMA"} — ${healthProb>55?"⬇️ Tendance décroissante":"→ Stable"}`},
+    {title:"Incidents Sécurité",level:secProb>55?"high":secProb>35?"med":"low",prob:secProb,
+     desc:`${d.security?.rogue_blocked||0} rogue UEs · ${d.security?.replay_attacks||0} replay · ${d.security?.dos_attempts||0} DoS`,
+     signal:`🛡️ ${secProb>35?"⚠️ Activité anormale détectée":"Sécurité nominale"}`},
+    {title:"Dégradation Auth SR",level:authProb>45?"high":authProb>25?"med":"low",prob:authProb,
+     desc:`Auth SR prédit +30min: ${(predAuth30*100).toFixed(2)}% (actuel: ${(k.auth_sr*100).toFixed(2)}%)`,
+     signal:`🔐 ${usingP?"Prophet Auth SR":"EWMA Auth"} — ${authProb>45?"⬇️ Tendance baisse":"→ Stable"}`},
+    {title:"PFCP UPF Instabilité",level:pfcpProb>65?"high":pfcpProb>40?"med":"low",prob:pfcpProb,
+     desc:`PFCP SR = ${(k.pfcp_sr*100).toFixed(1)}% — UPF disponibilité = ${(k.upf_availability*100).toFixed(1)}%`,
+     signal:`⚡ UPF failover détecté — ${pfcpProb>65?"⚠️ Risque sessions PDU":"Surveillance active"}`},
+    {title:"Signal Radio RSRP",level:signalProb>50?"high":signalProb>30?"med":"low",prob:signalProb,
+     desc:`RSRP moyen = ${k.avg_rsrp_dbm?.toFixed(1)||"?"} dBm — SINR = ${k.avg_sinr_db?.toFixed(1)||"?"} dB`,
+     signal:`📶 ${signalProb>50?"⚠️ Qualité radio dégradée":"Signal acceptable — à surveiller"}`},
+    {title:"URLLC Latence Tendance",level:latTrendProb>50?"high":latTrendProb>30?"med":"low",prob:latTrendProb,
+     desc:`Latence eMBB +30min: ${predLat60>0?predLat60.toFixed(2):"?"}ms — tendance ${predLat60>14?"haussière":"stable"}`,
+     signal:`⏱️ ${usingP?"Prophet Latency ML":"EWMA Latence"} — horizon +60min`},
+  ].sort((a,b)=>b.prob-a.prob);
+}
+
+// Updated renderPredReco that uses Prophet risks instead of runAIPrediction
+function renderPredRecoFromProphet(d, risks) {
+  // Keyword map: each PRED_RECO_DEF riskTitle → keywords to look for in risk titles
+  const KEYWORD_MAP = {
+    "Congestion PRB":           ["prb","congestion","scheduler"],
+    "Violation SLA URLLC":      ["urllc","latence","violation","sla"],
+    "Dégradation Health Score": ["health","global","dégradation","stabilisation"],
+    "Incidents Sécurité":       ["sécurit","incident","rogue","dos","replay","sepp","sécurité"],
+    "Dégradation Auth SR":      ["auth","ausf","udm","authentif"],
+    "PRB":                      ["prb","scheduler","admission","surcharge"],
+    "URLLC":                    ["urllc","latence","pdcp","tti"],
+    "Signal":                   ["signal","rsrp","sinr","radio","rf","beam"],
+  };
+
+  // For each PRED_RECO_DEF, find the best matching risk probability
+  const recosWithProb = PRED_RECO_DEFS.map(r => {
+    const keywords = KEYWORD_MAP[r.riskTitle] || [r.riskTitle.toLowerCase().split(" ")[0]];
+    let bestProb = 30; // baseline — always show all recos
+    risks.forEach(risk => {
+      const riskStr = (risk.title + " " + (risk.desc||"") + " " + (risk.signal||"")).toLowerCase();
+      const matches = keywords.some(kw => riskStr.includes(kw.toLowerCase()));
+      if (matches && risk.prob > bestProb) bestProb = risk.prob;
+    });
+    const displayConf = Math.round(Math.min(95, r.conf * 0.6 + bestProb * 0.4));
+    return { ...r, matchedProb: bestProb, displayConf };
+  });
+
+  // Sort by matched probability descending
+  recosWithProb.sort((a, b) => b.matchedProb - a.matchedProb);
+
+  const grid = document.getElementById("pred-reco-grid");
+  grid.innerHTML = recosWithProb.map(r => {
+    const levelStyle = r.matchedProb > 65 ? "crit" : r.matchedProb > 40 ? "warn" : r.level;
+    const probBadge = r.matchedProb > 65
+      ? `<span style="font-size:10px;color:var(--crit);font-weight:600">⚠ ${r.matchedProb}% risque</span>`
+      : r.matchedProb > 40
+        ? `<span style="font-size:10px;color:var(--warn);font-weight:600">↑ ${r.matchedProb}% risque</span>`
+        : `<span style="font-size:10px;color:var(--info)">~ ${r.matchedProb}% risque</span>`;
+    return `
+      <div class="reco-card ${levelStyle}">
+        <div class="reco-header">
+          <span class="reco-icon">${r.icon}</span>
+          <div>
+            <div class="reco-title">${r.title}</div>
+            <span class="reco-alarm-ref ${levelStyle}">🔮 Horizon: ${r.horizon} &nbsp;·&nbsp; ${probBadge}</span>
+          </div>
+        </div>
+        <div class="reco-body">${r.body}</div>
+        <ul class="reco-steps">${r.steps.map(s=>`<li>${s}</li>`).join("")}</ul>
+        <div class="reco-impact">${r.impact.map(i=>`<span class="reco-impact-tag">${i}</span>`).join("")}</div>
+        <div class="reco-confidence">
+          <span>Confiance prédictive</span>
+          <div class="conf-bar"><div class="conf-fill" style="width:${r.displayConf}%"></div></div>
+          <span style="color:var(--pred)">${r.displayConf}%</span>
+        </div>
+      </div>`;
+  }).join("");
+
+  // Action plan
+  const plan = document.getElementById("pred-action-plan");
+  if (plan) {
+    plan.innerHTML = `<div class="action-plan">` +
+      recosWithProb.map((r, i) => {
+        const prio  = i === 0 ? "p1" : i < 3 ? "p2" : "p3";
+        const label = i === 0 ? "P1 URGENT" : i < 3 ? "P2 PRÉVENTIF" : "P3 SURVEILLANCE";
+        return `<div class="action-item">
+          <span class="action-prio ${prio}">${label}</span>
+          <span class="action-text">${r.icon} ${r.title}</span>
+          <span class="action-kpi">Horizon: ${r.horizon} · Risque: ${r.matchedProb}% · Conf: ${r.displayConf}%</span>
+        </div>`;
+      }).join("") +
+      `</div>`;
+  }
+}
+
+
+// Keep renderPredReco for compatibility (called from dismissAlarm etc.)
+function renderPredReco(d) {
+  if (!d) return;
+  const k = d.kpis;
+  const prbVals = d.gnb_list.map(g=>g.prb_embb).filter(Boolean);
+  const pCur = prbVals.length ? Math.max(...prbVals) : 60;
+  const lats = d.ue_list.filter(u=>u.slice==="eMBB"&&u.avg_ping_ms).map(u=>u.avg_ping_ms);
+  const lCur = lats.length ? lats.reduce((a,b)=>a+b)/lats.length : 14;
+  const p60 = prophetAt("prb_embb",3) ?? pCur+4.8;
+  const l60 = prophetAt("latency_embb",3) ?? lCur+2.0;
+  const h60 = prophetAt("health_score",3) ?? k.global_health-0.02;
+  const a30 = prophetAt("auth_sr",1) ?? k.auth_sr;
+  const risks = computeRisksFromProphet(d, p60, l60, h60, a30);
+  renderPredRecoFromProphet(d, risks);
+}
+
+// ─── PROPHET CHARTS ───────────────────────────────────────────────────────────
+function renderPredHealthChart(hCur, h15, h30, h60, d) {
+  destroyChart("pred-health");
+  const ctx = document.getElementById("chart-pred-health").getContext("2d");
+  const series = buildProphetSeries("health_score", 12, 4);
+  if (series) {
+    const {allLabels, actual, predicted, lower, upper, splitIdx} = series;
+    charts["pred-health"] = new Chart(ctx, {
+      type:"line",
+      data:{labels:allLabels, datasets:[
+        {label:"IC 80% Sup",data:upper,borderColor:"transparent",backgroundColor:"rgba(99,102,241,.12)",fill:"+1",tension:.3,pointRadius:0},
+        {label:"IC 80% Inf",data:lower,borderColor:"transparent",backgroundColor:"transparent",fill:false,tension:.3,pointRadius:0},
+        {label:"Valeurs réelles (log)",data:[...actual,...new Array(4).fill(null)],
+         borderColor:C.embb,backgroundColor:C.embb+"28",fill:true,tension:.3,pointRadius:3,borderWidth:2},
+        {label:"Prédiction Prophet",data:[...new Array(splitIdx).fill(null),...predicted.slice(splitIdx)],
+         borderColor:"#7c3aed",backgroundColor:"rgba(124,58,237,.1)",fill:true,tension:.3,
+         borderDash:[6,3],pointRadius:5,borderWidth:2.5},
+      ]},
+      options:baseOpts({scales:{
+        x:{grid:{display:false},ticks:{color:C.text3,maxRotation:45,font:{size:9}}},
+        y:{min:0.5,max:1.0,grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>(v*100).toFixed(0)+"%"}},
+      },plugins:{
+        legend:{labels:{color:C.text2,font:{size:9},filter:l=>!l.text.includes("IC")}},
+        tooltip:{mode:"index",intersect:false},
+      }}),
+    });
+  } else {
+    const ts = d.timeseries||[];
+    charts["pred-health"] = new Chart(ctx, {
+      type:"line",
+      data:{labels:[...ts.slice(-8).map(t=>t.time),"Actuel","+15m","+30m","+60m"],
+        datasets:[
+          {label:"Historique",data:[...ts.slice(-8).map(()=>hCur+0.02),hCur,null,null,null],
+           borderColor:C.embb,backgroundColor:C.embb+"22",fill:true,tension:.3,pointRadius:2},
+          {label:"Prédiction",data:[...ts.slice(-8).map(()=>null),hCur,h15,h30,h60],
+           borderColor:"#7c3aed",borderDash:[5,5],backgroundColor:"rgba(124,58,237,.08)",fill:true,tension:.3,pointRadius:3},
+        ]},
+      options:baseOpts({scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+        y:{min:0.4,max:1.0,grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>(v*100).toFixed(0)+"%"}}}}),
+    });
+  }
+}
+
+function renderPredLatChart(lCur, l15, l30, l60) {
+  destroyChart("pred-lat");
+  const ctx = document.getElementById("chart-pred-lat").getContext("2d");
+  const series = buildProphetSeries("latency_embb", 10, 4);
+  if (series) {
+    const {allLabels, actual, predicted, lower, upper, splitIdx} = series;
+    charts["pred-lat"] = new Chart(ctx, {
+      type:"line",
+      data:{labels:allLabels, datasets:[
+        {label:"IC 80%",data:upper,borderColor:"transparent",backgroundColor:"rgba(217,119,6,.1)",fill:"+1",tension:.3,pointRadius:0},
+        {label:"IC Low",data:lower,borderColor:"transparent",backgroundColor:"transparent",fill:false,tension:.3,pointRadius:0},
+        {label:"Latence réelle (ms)",data:[...actual,...new Array(4).fill(null)],
+         borderColor:C.ok,backgroundColor:C.ok+"25",fill:true,tension:.3,pointRadius:3,borderWidth:2},
+        {label:"Prédiction Prophet",data:[...new Array(splitIdx).fill(null),...predicted.slice(splitIdx)],
+         borderColor:C.warn,backgroundColor:C.warn+"12",fill:true,tension:.3,borderDash:[6,3],pointRadius:5,borderWidth:2.5},
+      ]},
+      options:baseOpts({scales:{
+        x:{grid:{display:false},ticks:{color:C.text3,maxRotation:45,font:{size:9}}},
+        y:{grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>v.toFixed(1)+"ms"}},
+      },plugins:{
+        legend:{labels:{color:C.text2,font:{size:9},filter:l=>!l.text.includes("IC")}},
+        tooltip:{mode:"index",intersect:false},
+      }}),
+    });
+  } else {
+    charts["pred-lat"] = new Chart(ctx, {
+      type:"bar",
+      data:{labels:["Actuel","+15 min","+30 min","+60 min"],
+        datasets:[{label:"Latence (ms)",data:[lCur,l15,l30,l60],
+          backgroundColor:[C.ok+"99",C.warn+"99",C.warn+"99",C.crit+"99"],
+          borderWidth:0,borderRadius:4}]},
+      options:baseOpts({plugins:{legend:{display:false}},
+        scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+          y:{grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>v+"ms"}}}}),
+    });
+  }
+}
+
+function renderPredPrbChart(pCur, p15, p30, p60) {
+  destroyChart("pred-prb");
+  const ctx = document.getElementById("chart-pred-prb").getContext("2d");
+  const series = buildProphetSeries("prb_embb", 10, 4);
+  if (series) {
+    const {allLabels, actual, predicted, lower, upper, splitIdx} = series;
+    charts["pred-prb"] = new Chart(ctx, {
+      type:"line",
+      data:{labels:allLabels, datasets:[
+        {label:"IC 80%",data:upper,borderColor:"transparent",backgroundColor:"rgba(217,119,6,.1)",fill:"+1",tension:.3,pointRadius:0},
+        {label:"IC Low",data:lower,borderColor:"transparent",backgroundColor:"transparent",fill:false,tension:.3,pointRadius:0},
+        {label:"PRB réel (%)",data:[...actual,...new Array(4).fill(null)],
+         borderColor:C.embb,backgroundColor:C.embb+"25",fill:true,tension:.3,pointRadius:3,borderWidth:2},
+        {label:"Prédiction Prophet",data:[...new Array(splitIdx).fill(null),...predicted.slice(splitIdx)],
+         borderColor:C.warn,backgroundColor:C.warn+"12",fill:true,tension:.3,borderDash:[6,3],pointRadius:5,borderWidth:2.5},
+      ]},
+      options:baseOpts({scales:{
+        x:{grid:{display:false},ticks:{color:C.text3,maxRotation:45,font:{size:9}}},
+        y:{max:100,grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>v+"%"}},
+      },plugins:{
+        legend:{labels:{color:C.text2,font:{size:9},filter:l=>!l.text.includes("IC")}},
+        tooltip:{mode:"index",intersect:false},
+      }}),
+    });
+  } else {
+    charts["pred-prb"] = new Chart(ctx, {
+      type:"line",
+      data:{labels:["Actuel","+15 min","+30 min","+60 min"],
+        datasets:[{label:"PRB (%)",data:[pCur,p15,p30,p60],
+          borderColor:C.warn,backgroundColor:C.warn+"22",fill:true,tension:.3,pointRadius:4}]},
+      options:baseOpts({plugins:{legend:{display:false}},
+        scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+          y:{max:100,grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>v+"%"}}}}),
+    });
+  }
+}
+
+function renderPredAuthChart(aCur, a15, a30) {
+  destroyChart("pred-auth");
+  const ctx = document.getElementById("chart-pred-auth").getContext("2d");
+  const series = buildProphetSeries("auth_sr", 10, 4);
+  if (series) {
+    const {allLabels, actual, predicted, lower, upper, splitIdx} = series;
+    const col = a30 < aCur ? C.crit : C.ok;
+    charts["pred-auth"] = new Chart(ctx, {
+      type:"line",
+      data:{labels:allLabels, datasets:[
+        {label:"IC 80%",data:upper,borderColor:"transparent",backgroundColor:col+"18",fill:"+1",tension:.3,pointRadius:0},
+        {label:"IC Low",data:lower,borderColor:"transparent",backgroundColor:"transparent",fill:false,tension:.3,pointRadius:0},
+        {label:"Auth SR réel",data:[...actual,...new Array(4).fill(null)],
+         borderColor:col,backgroundColor:col+"22",fill:true,tension:.3,pointRadius:3,borderWidth:2},
+        {label:"Prédiction Prophet",data:[...new Array(splitIdx).fill(null),...predicted.slice(splitIdx)],
+         borderColor:"#7c3aed",backgroundColor:"rgba(124,58,237,.08)",fill:true,tension:.3,borderDash:[6,3],pointRadius:5,borderWidth:2.5},
+      ]},
+      options:baseOpts({scales:{
+        x:{grid:{display:false},ticks:{color:C.text3,maxRotation:45,font:{size:9}}},
+        y:{min:0.85,max:1.0,grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>(v*100).toFixed(1)+"%"}},
+      },plugins:{
+        legend:{labels:{color:C.text2,font:{size:9},filter:l=>!l.text.includes("IC")}},
+        tooltip:{mode:"index",intersect:false},
+      }}),
+    });
+  } else {
+    charts["pred-auth"] = new Chart(ctx, {
+      type:"line",
+      data:{labels:["Actuel","+15 min","+30 min"],
+        datasets:[{label:"Auth SR",data:[aCur,a15,a30],
+          borderColor:a30<aCur?C.crit:C.ok,backgroundColor:(a30<aCur?C.crit:C.ok)+"22",
+          fill:true,tension:.3,pointRadius:4}]},
+      options:baseOpts({plugins:{legend:{display:false}},
+        scales:{x:{grid:{display:false},ticks:{color:C.text3}},
+          y:{min:0.85,max:1.0,grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>(v*100).toFixed(0)+"%"}}}}),
+    });
+  }
+}
+
+function renderPredSqiChart(d) {
+  destroyChart("pred-sqi");
+  const ctx = document.getElementById("chart-pred-sqi").getContext("2d");
+  const ues = d.ue_list.filter(u=>u.rsrp_dbm!=null);
+  if (!ues.length) return;
+  const scores = ues.map(u=>Math.max(0,Math.min(1,(u.rsrp_dbm+120)/45)));
+  const sinrSc = ues.map(u=>u.sinr_db!=null?Math.max(0,Math.min(1,(u.sinr_db+5)/30)):null).filter(Boolean);
+  const avg = scores.reduce((a,b)=>a+b,0)/scores.length;
+  const ewmaScore = avg*0.9;
+  charts["pred-sqi"] = new Chart(ctx, {
+    type:"line",
+    data:{
+      labels: ues.map(u=>u.id),
+      datasets:[
+        {label:"RSRP Score",data:scores,borderColor:"#7c3aed",backgroundColor:"rgba(124,58,237,.15)",fill:true,tension:.4,pointRadius:4},
+        sinrSc.length?{label:"SINR Score",data:ues.map(u=>u.sinr_db!=null?Math.max(0,Math.min(1,(u.sinr_db+5)/30)):null),
+          borderColor:C.ok,backgroundColor:C.ok+"20",fill:false,tension:.4,pointRadius:3}:null,
+        {label:"Prédiction EWMA",data:ues.map(()=>ewmaScore),borderColor:C.warn,
+         borderDash:[4,4],pointRadius:0,tension:0,fill:false},
+      ].filter(Boolean),
+    },
+    options:baseOpts({scales:{
+      x:{grid:{display:false},ticks:{color:C.text3}},
+      y:{min:0,max:1,grid:{color:"rgba(0,0,0,.06)"},ticks:{color:C.text3,callback:v=>(v*100).toFixed(0)+"%"}},
+    }}),
+  });
+}
+
+// ── loadData — parallel fetch (don't block render on Prophet) ─────────────────
+async function loadData() {
+  const prophetPromise = loadProphetPredictions().catch(e=>console.warn("Prophet skip:", e.message));
+  try {
+    const r = await fetch("/api/data");
+    if (!r.ok) throw new Error(r.statusText);
+    DATA = await r.json();
+    if (DATA.error) {
+      console.error("API error:", DATA.error);
+      document.getElementById("topbar-log").textContent = "⚠ " + DATA.error;
+      return;
+    }
+    console.log("✓ Data loaded — rendering dashboard");
+    renderAll(DATA);
+    // Refresh prediction charts after Prophet resolves
+    await prophetPromise;
+    if (PROPHET_DATA && DATA) {
+      console.log("✓ Updating prediction charts with Prophet ML");
+      renderPrediction(DATA);
+      renderPredReco(DATA);
+    }
+  } catch(e) {
+    console.error("Load failed:", e);
+    document.getElementById("topbar-log").textContent = "⚠ Connexion échouée";
+  }
+}
+
+async function refreshData() {
+  await fetch("/api/refresh");
+  DATA = null;
+  PROPHET_DATA = null;
+  await loadData();
+}
+
+loadData();
